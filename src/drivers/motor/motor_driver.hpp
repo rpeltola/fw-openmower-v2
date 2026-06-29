@@ -19,6 +19,7 @@ class MotorDriver {
       ESC_STATUS_STALLED = 150u,
       ESC_STATUS_OK = 200u,
       ESC_STATUS_RUNNING = 201u,
+      ESC_STATUS_POWERED_OFF = 50u,  // intentionally powered down (not a fault)
     };
 
     uint8_t fw_major;

@@ -35,7 +35,9 @@ void MowerService::tick() {
     mower_duty_ = 0;
   }
 
-  if (!duty_sent_) {
+  // Stop commanding while power_service is intentionally idling the ESCs, so the
+  // xESC command-timeout releases the motor and the gate driver can sleep.
+  if (!duty_sent_ && !power_service.EscPowerIsOff()) {
     // Send motor speed to VESC, if we havent in the meantime
     // (e.g. due to new value or emergency)
     SetDuty();
@@ -53,7 +55,9 @@ void MowerService::tick() {
   if (xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > 1'000'000 || !esc_state_valid_) {
     // No recent update received (or none at all)
     mower_duty_ = 0;
-    SendMowerStatus(static_cast<uint8_t>(MotorDriver::ESCState::ESCStatus::ESC_STATUS_DISCONNECTED));
+    SendMowerStatus(static_cast<uint8_t>(power_service.EscPowerIsOff()
+                                             ? MotorDriver::ESCState::ESCStatus::ESC_STATUS_POWERED_OFF
+                                             : MotorDriver::ESCState::ESCStatus::ESC_STATUS_DISCONNECTED));
   } else {
     // We got recent data, send it
     StartTransaction();
@@ -106,6 +110,11 @@ void MowerService::OnMowerEnabledChanged(const uint8_t& new_value) {
 
 void MowerService::SetDriver(MotorDriver* motor_driver) {
   mower_driver_ = motor_driver;
+}
+
+bool MowerService::IsHealthy() {
+  // Intentional ESC power-off (idle on the dock) is healthy, not a fault.
+  return power_service.EscPowerIsOff() || (IsRunning() && esc_ever_connected_);
 }
 void MowerService::OnEmergencyChangedEvent() {
   bool emergency = emergency_service.GetEmergencyReasons() != 0;

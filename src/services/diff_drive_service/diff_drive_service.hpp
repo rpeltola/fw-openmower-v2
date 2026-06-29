@@ -49,9 +49,9 @@ class DiffDriveService : public DiffDriveServiceBase {
 
   void SetDrivers(MotorDriver *left_driver, MotorDriver *right_driver);
 
-  bool IsHealthy() override {
-    return IsRunning() && (escs_connected_.load() == (ESC_LEFT | ESC_RIGHT));
-  }
+  // Defined in the .cpp so it can consult power_service (intentional ESC
+  // power-off is healthy, not a fault).
+  bool IsHealthy() override;
 
  protected:
   bool OnStart() override;
