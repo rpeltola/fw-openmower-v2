@@ -18,6 +18,7 @@ class PwmMotorDriver : public MotorDriver {
   void SetEncoder(uint32_t line_encoder_a, uint32_t line_encoder_b);
   void RequestStatus() override;
   void SetDuty(float duty) override;
+  void SetSpeed(float erpm) override;
   bool Start() override;
 
  private:

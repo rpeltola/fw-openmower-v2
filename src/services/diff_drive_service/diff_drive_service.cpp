@@ -21,8 +21,8 @@ void DiffDriveService::OnEmergencyChangedEvent() {
   chMtxLock(&state_mutex_);
   speed_l_ = 0;
   speed_r_ = 0;
-  // Instantly send the 0 duty cycle
-  SetDuty();
+  // Instantly send the 0 command
+  SendMotorCommand();
   chMtxUnlock(&state_mutex_);
 }
 void DiffDriveService::SetDrivers(MotorDriver* left_driver, MotorDriver* right_driver) {
@@ -72,14 +72,14 @@ void DiffDriveService::OnStop() {
 void DiffDriveService::tick() {
   chMtxLock(&state_mutex_);
 
-  // Check, if we recently received duty. If not, set to zero for safety
+  // Check, if we recently received a command. If not, set to zero for safety
   if (xbot::service::system::getTimeMicros() - last_duty_received_micros_ > 1'000'000) {
-    // it's ok to set it here, because we know that duty_set_ is false (we're in a timeout after all)
+    // it's ok to set it here, because we know that command_sent_ is false (we're in a timeout after all)
     speed_l_ = speed_r_ = 0;
   }
 
-  if (!duty_sent_) {
-    SetDuty();
+  if (!command_sent_) {
+    SendMotorCommand();
   }
 
   left_esc_driver_->RequestStatus();
@@ -97,21 +97,25 @@ void DiffDriveService::tick() {
     CommitTransaction();
   }
 
-  duty_sent_ = false;
+  command_sent_ = false;
   chMtxUnlock(&state_mutex_);
 }
 
-void DiffDriveService::SetDuty() {
-  // Get the current emergency state
+void DiffDriveService::SendMotorCommand() {
+  // Get the current emergency state. On emergency we always command 0.
   bool emergency = emergency_service.GetEmergencyReasons() != 0;
-  if (emergency) {
-    left_esc_driver_->SetDuty(0);
-    right_esc_driver_->SetDuty(0);
+  const float cmd_l = emergency ? 0.0f : speed_l_;
+  const float cmd_r = emergency ? 0.0f : speed_r_;
+  if (ControlMode.value == kControlModeSpeed) {
+    // speed_l_/speed_r_ hold ERPM; let the ESC close the speed loop.
+    left_esc_driver_->SetSpeed(cmd_l);
+    right_esc_driver_->SetSpeed(cmd_r);
   } else {
-    left_esc_driver_->SetDuty(speed_l_);
-    right_esc_driver_->SetDuty(speed_r_);
+    // speed_l_/speed_r_ hold duty in [-1, 1].
+    left_esc_driver_->SetDuty(cmd_l);
+    right_esc_driver_->SetDuty(cmd_r);
   }
-  duty_sent_ = true;
+  command_sent_ = true;
 }
 
 void DiffDriveService::LeftESCCallback(const MotorDriver::ESCState& state) {
@@ -148,6 +152,25 @@ void DiffDriveService::ProcessStatusUpdate() {
   SendRightESCCurrent(right_esc_state_.current_input);
   SendRightESCStatus(static_cast<uint8_t>(right_esc_state_.status));
 
+  // Forward the remaining ESC telemetry already parsed into ESCState.
+  SendLeftESCRpm(left_esc_state_.rpm);
+  SendLeftESCDutyCycle(left_esc_state_.duty_cycle);
+  SendLeftESCInputVoltage(left_esc_state_.voltage_input);
+  SendLeftESCMotorTemperature(left_esc_state_.temperature_motor);
+  SendLeftESCTachoAbsolute(left_esc_state_.tacho_absolute);
+  SendLeftESCDirection(static_cast<uint8_t>(left_esc_state_.direction));
+  SendLeftESCFWMajor(left_esc_state_.fw_major);
+  SendLeftESCFWMinor(left_esc_state_.fw_minor);
+
+  SendRightESCRpm(right_esc_state_.rpm);
+  SendRightESCDutyCycle(right_esc_state_.duty_cycle);
+  SendRightESCInputVoltage(right_esc_state_.voltage_input);
+  SendRightESCMotorTemperature(right_esc_state_.temperature_motor);
+  SendRightESCTachoAbsolute(right_esc_state_.tacho_absolute);
+  SendRightESCDirection(static_cast<uint8_t>(right_esc_state_.direction));
+  SendRightESCFWMajor(right_esc_state_.fw_major);
+  SendRightESCFWMinor(right_esc_state_.fw_minor);
+
   // Calculate the twist according to wheel ticks
   if (last_ticks_valid) {
     float dt = static_cast<float>(micros - last_ticks_micros_) / 1'000'000.0f;
@@ -182,24 +205,33 @@ void DiffDriveService::OnControlTwistChanged(const double* new_value, uint32_t l
   const auto linear = static_cast<float>(new_value[0]);
   const auto angular = static_cast<float>(new_value[5]);
 
-  // TODO: update this to rad/s values and implement xESC speed control
-  speed_r_ = -(linear + 0.5f * static_cast<float>(WheelDistance.value) * angular);
-  speed_l_ = linear - 0.5f * static_cast<float>(WheelDistance.value) * angular;
+  // Per-wheel command. NOTE: the incoming twist is NOT a physical velocity - the
+  // high-level stack (app joystick, mower_logic, nav) emits normalized values in
+  // [-1, 1] (a duty-equivalent). The right wheel is mounted mirrored, hence the sign.
+  const float raw_r = -(linear + 0.5f * static_cast<float>(WheelDistance.value) * angular);
+  const float raw_l = linear - 0.5f * static_cast<float>(WheelDistance.value) * angular;
+  // Clamp to the normalized range (same as the duty path) before use.
+  const float frac_r = raw_r > 1.0f ? 1.0f : (raw_r < -1.0f ? -1.0f : raw_r);
+  const float frac_l = raw_l > 1.0f ? 1.0f : (raw_l < -1.0f ? -1.0f : raw_l);
 
-  if (speed_l_ >= 1.0) {
-    speed_l_ = 1.0;
-  } else if (speed_l_ <= -1.0) {
-    speed_l_ = -1.0;
-  }
-  if (speed_r_ >= 1.0) {
-    speed_r_ = 1.0;
-  } else if (speed_r_ <= -1.0) {
-    speed_r_ = -1.0;
+  if (ControlMode.value == kControlModeSpeed) {
+    // Map the normalized command to a real wheel speed and convert to ERPM, so the
+    // ESC closes the loop. Full-scale (frac = 1) corresponds to kMaxWheelSpeedMps.
+    // Reuses the already-calibrated WheelTicksPerMeter register:
+    //   ERPM = frac * max_speed[m/s] * ticks_per_meter * 60 / ticks_per_electrical_rev
+    const float erpm_full =
+        kMaxWheelSpeedMps * static_cast<float>(WheelTicksPerMeter.value) * (60.0f / kTicksPerElectricalRev);
+    speed_l_ = frac_l * erpm_full;
+    speed_r_ = frac_r * erpm_full;
+  } else {
+    // Open-loop duty: the normalized command IS the duty cycle.
+    speed_l_ = frac_l;
+    speed_r_ = frac_r;
   }
 
   // Limit comms frequency to once per tick()
-  if (!duty_sent_) {
-    SetDuty();
+  if (!command_sent_) {
+    SendMotorCommand();
   }
   chMtxUnlock(&state_mutex_);
 }

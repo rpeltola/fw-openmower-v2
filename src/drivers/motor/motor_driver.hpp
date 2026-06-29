@@ -43,6 +43,8 @@ class MotorDriver {
 
   virtual void RequestStatus() = 0;
   virtual void SetDuty(float duty) = 0;
+  // Command a closed-loop electrical RPM target (the ESC closes the speed loop).
+  virtual void SetSpeed(float erpm) = 0;
 
   virtual bool Start() {
     chDbgAssert(!started_, "Don't start twice");

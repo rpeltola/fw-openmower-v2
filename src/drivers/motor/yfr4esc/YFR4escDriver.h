@@ -25,6 +25,7 @@ class YFR4escDriver : public DebuggableDriver, public MotorDriver {
 
   void RequestStatus() override{};  // No-op, ESC streams status periodically
   void SetDuty(float duty) override;
+  void SetSpeed(float erpm) override;
   bool Start() override;
 
   void RawDataInput(uint8_t* data, size_t size) override;

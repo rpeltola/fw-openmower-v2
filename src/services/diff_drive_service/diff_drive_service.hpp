@@ -37,9 +37,25 @@ class DiffDriveService : public DiffDriveServiceBase {
   bool last_ticks_valid = false;
   uint32_t last_ticks_micros_ = 0;
 
+  // Per-wheel motor command. Meaning depends on the active control mode:
+  //   duty mode (Control Mode == 0): duty cycle in [-1, 1]
+  //   speed mode (Control Mode == 1): electrical RPM (ERPM)
   float speed_l_ = 0;
   float speed_r_ = 0;
-  bool duty_sent_ = false;
+  // True once the command has been sent in the current tick window.
+  bool command_sent_ = false;
+
+  // Control Mode register values.
+  static constexpr uint8_t kControlModeDuty = 0;
+  static constexpr uint8_t kControlModeSpeed = 1;
+  // VESC FOC tachometer counts per electrical revolution. Used to convert a
+  // per-wheel speed [m/s] to ERPM. Verify against the running xESC FW.
+  static constexpr float kTicksPerElectricalRev = 6.0f;
+  // Wheel speed [m/s] commanded at full-scale (normalized command == 1.0) in speed
+  // mode. The high-level twist is normalized [-1,1], not m/s, so this sets the top
+  // speed. ~0.5 keeps full-stick just under the measured motor ceiling (~0.54 m/s).
+  // TODO: promote to a configurable register/param (ll/services/diff_drive/max_wheel_speed).
+  static constexpr float kMaxWheelSpeedMps = 0.5f;
 
  public:
   explicit DiffDriveService(uint16_t service_id) : DiffDriveServiceBase(service_id, wa, sizeof(wa)) {
@@ -63,7 +79,9 @@ class DiffDriveService : public DiffDriveServiceBase {
   ServiceSchedule tick_schedule_{*this, 40'000,
                                  XBOT_FUNCTION_FOR_METHOD(DiffDriveService, &DiffDriveService::tick, this)};
 
-  void SetDuty();
+  // Sends the current per-wheel command to both ESCs, dispatching to duty or
+  // speed control based on the Control Mode register. Forces 0 on emergency.
+  void SendMotorCommand();
 
   void LeftESCCallback(const MotorDriver::ESCState &state);
   void RightESCCallback(const MotorDriver::ESCState &state);

@@ -63,6 +63,8 @@ void VescDriver::ProcessPayload() {
 
       latest_state_.fw_major = message[index++];
       latest_state_.fw_minor = message[index++];
+      // Got it; stop re-requesting on subsequent status cycles.
+      fw_version_received_ = true;
       break;
     case COMM_GET_VALUES:  // Structure defined here:
                            // https://github.com/vedderb/bldc/blob/43c3bbaf91f5052a35b75c2ff17b5fe99fad94d1/commands.c#L164
@@ -185,6 +187,13 @@ void VescDriver::RequestStatus() {
     return;
   }
   chMtxLock(&mutex_);
+  // Request the (static) ESC firmware version once, until the ESC answers.
+  // SendPacket transmits synchronously, so reusing payload_buffer_ afterwards is safe.
+  if (!fw_version_received_) {
+    payload_buffer_.payload_length = 1;
+    payload_buffer_.payload[0] = COMM_FW_VERSION;
+    SendPacket();
+  }
   payload_buffer_.payload_length = 1;
   payload_buffer_.payload[0] = COMM_GET_VALUES;
   SendPacket();
@@ -204,6 +213,22 @@ void VescDriver::SetDuty(float duty) {
   payload_buffer_.payload[0] = COMM_SET_DUTY;
   int32_t index = 1;
   buffer_append_int32(payload_buffer_.payload, static_cast<int32_t>(duty * 100000), &index);
+  SendPacket();
+  chMtxUnlock(&mutex_);
+}
+
+void VescDriver::SetSpeed(float erpm) {
+  if (IsRawMode()) {
+    // ignore when a raw data stream is connected
+    return;
+  }
+
+  chMtxLock(&mutex_);
+  payload_buffer_.payload_length = 5;
+  payload_buffer_.payload[0] = COMM_SET_RPM;
+  int32_t index = 1;
+  // ERPM is sent as a plain int32 (no *100000 scaling - that is duty-specific).
+  buffer_append_int32(payload_buffer_.payload, static_cast<int32_t>(erpm), &index);
   SendPacket();
   chMtxUnlock(&mutex_);
 }

@@ -24,6 +24,7 @@ class VescDriver : public DebuggableDriver, public MotorDriver {
   bool SetUART(UARTDriver *uart, uint32_t baudrate);
   void RequestStatus() override;
   void SetDuty(float duty) override;
+  void SetSpeed(float erpm) override;
 
   void RawDataInput(uint8_t *data, size_t size) override;
 
@@ -57,6 +58,10 @@ class VescDriver : public DebuggableDriver, public MotorDriver {
 
   static constexpr size_t RECV_BUFFER_SIZE = 260;
   uint32_t last_status_request_millis_ticks_ = 0;
+
+  // The ESC firmware version is static, so request it once (retry until the ESC
+  // answers, then stop). Set by ProcessPayload when a COMM_FW_VERSION arrives.
+  volatile bool fw_version_received_ = false;
 
   // Keep two buffers for streaming data while doing processing
   uint8_t recv_buffer1_[RECV_BUFFER_SIZE]{};
