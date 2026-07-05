@@ -125,18 +125,6 @@ void YFR4escDriver::SetDuty(float duty) {
   SendControl(duty);
 }
 
-void YFR4escDriver::SetSpeed(float erpm) {
-  // This ESC does not support closed-loop speed commands. Refuse safely by
-  // holding zero duty rather than silently no-op'ing or interpreting ERPM as duty.
-  (void)erpm;
-  static bool warned = false;
-  if (!warned) {
-    warned = true;
-    ULOGT_EVERY_MS(WARNING, 1000, "SetSpeed (closed-loop RPM) not supported by YFR4esc; holding 0");
-  }
-  SetDuty(0.0f);
-}
-
 void YFR4escDriver::SendControl(float duty) {
   ControlPacket cp{.message_type = MessageType::CONTROL, .duty_cycle = static_cast<double>(duty), .crc = 0};
   const uint8_t* payload = reinterpret_cast<const uint8_t*>(&cp);

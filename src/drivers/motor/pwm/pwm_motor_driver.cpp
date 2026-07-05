@@ -35,17 +35,6 @@ void PwmMotorDriver::SetDuty(float duty) {
     pwmEnableChannel(pwm_, channel_1_, 0);
   }
 }
-void PwmMotorDriver::SetSpeed(float erpm) {
-  // PWM drive is open-loop and cannot close a speed loop. Refuse safely by
-  // holding zero rather than silently no-op'ing or interpreting ERPM as duty.
-  (void)erpm;
-  static bool warned = false;
-  if (!warned) {
-    warned = true;
-    ULOG_WARNING("SetSpeed (closed-loop RPM) not supported by PwmMotorDriver; holding 0");
-  }
-  SetDuty(0.0f);
-}
 bool PwmMotorDriver::Start() {
   chDbgAssert(pwm_ != nullptr, "pwm cannot be null");
   chDbgAssert(line_encoder_a_ != 0 && line_encoder_b_ != 0, "encoder lines must be set");

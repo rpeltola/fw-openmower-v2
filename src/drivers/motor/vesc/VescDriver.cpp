@@ -217,22 +217,6 @@ void VescDriver::SetDuty(float duty) {
   chMtxUnlock(&mutex_);
 }
 
-void VescDriver::SetSpeed(float erpm) {
-  if (IsRawMode()) {
-    // ignore when a raw data stream is connected
-    return;
-  }
-
-  chMtxLock(&mutex_);
-  payload_buffer_.payload_length = 5;
-  payload_buffer_.payload[0] = COMM_SET_RPM;
-  int32_t index = 1;
-  // ERPM is sent as a plain int32 (no *100000 scaling - that is duty-specific).
-  buffer_append_int32(payload_buffer_.payload, static_cast<int32_t>(erpm), &index);
-  SendPacket();
-  chMtxUnlock(&mutex_);
-}
-
 void VescDriver::RawDataInput(uint8_t* data, size_t size) {
   if (!IsRawMode()) {
     return;
