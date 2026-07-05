@@ -177,7 +177,8 @@ void DiffDriveService::ProcessStatusUpdate() {
     int32_t d_left = static_cast<int32_t>(left_esc_state_.tacho - last_ticks_left);
     int32_t d_right = static_cast<int32_t>(right_esc_state_.tacho - last_ticks_right);
     float vx = static_cast<float>(d_left - d_right) / (2.0f * dt * static_cast<float>(WheelTicksPerMeter.value));
-    float vr = -static_cast<float>(d_left + d_right) / (2.0f * dt * static_cast<float>(WheelTicksPerMeter.value));
+    float vr = -static_cast<float>(d_left + d_right) /
+               (static_cast<float>(WheelDistance.value) * dt * static_cast<float>(WheelTicksPerMeter.value));
     double data[6]{};
     data[0] = vx;
     data[5] = vr;
