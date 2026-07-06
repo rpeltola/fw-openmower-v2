@@ -17,6 +17,8 @@ PowerService power_service{xbot::service_ids::POWER};
 GpsService gps_service{xbot::service_ids::GPS};
 InputService input_service{xbot::service_ids::INPUT};
 HighLevelService high_level_service{xbot::service_ids::HIGH_LEVEL};
+FilesystemService filesystem_service{xbot::service_ids::FILESYSTEM};
+SoundService sound_service;
 
 void StartServices() {
 #define START_IF_NEEDED(service, id)                \
@@ -52,6 +54,10 @@ void StartServices() {
   }
 
   START_IF_NEEDED(emergency_service, EMERGENCY)
+  // Not an xbot service (no RPC/service_id) - just a plain thread, started directly rather than
+  // through START_IF_NEEDED. Depends on EmergencyService (emergency-reason sound triggers) being
+  // up.
+  sound_service.Start();
   START_IF_NEEDED(imu_service, IMU)
   START_IF_NEEDED(power_service, POWER)
   START_IF_NEEDED(diff_drive, DIFF_DRIVE)
@@ -59,4 +65,5 @@ void StartServices() {
   START_IF_NEEDED(gps_service, GPS)
   START_IF_NEEDED(input_service, INPUT)
   START_IF_NEEDED(high_level_service, HIGH_LEVEL)
+  START_IF_NEEDED(filesystem_service, FILESYSTEM)
 }
