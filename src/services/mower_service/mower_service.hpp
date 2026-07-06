@@ -48,7 +48,7 @@ class MowerService : public MowerServiceBase {
   void ESCCallback(const MotorDriver::ESCState& state);
 
  protected:
-  void OnMowerEnabledChanged(const uint8_t& new_value) override;
+  void OnMowerSpeedChanged(const float& new_value) override;
 
  private:
   THD_WORKING_AREA(wa, 1024){};
@@ -57,7 +57,7 @@ class MowerService : public MowerServiceBase {
   uint32_t last_duty_received_micros_ = 0;
   uint32_t last_valid_esc_state_micros_ = 0;
 
-  float mower_duty_ = 0;
+  float mower_duty_ = 0;  // commanded normalized speed/duty in [-1, 1]; sign = direction, 0 = off
   bool duty_sent_ = false;
   etl::atomic<bool> esc_ever_connected_{false};
   MotorDriver* mower_driver_ = nullptr;
