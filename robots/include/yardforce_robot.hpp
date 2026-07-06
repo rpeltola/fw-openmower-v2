@@ -39,6 +39,18 @@ class YardForceRobot : public MowerRobot {
     return 7.0f * 3.0;
   }
 
+  // Main-board rain sensor: AGPIO3 / PA6 / ADC1_IN3 (passive 2-plate resistive,
+  // wet raises the reading). The wet threshold is provided at runtime from ROS
+  // (MowerService "Rain Threshold" input, 0 = disabled).
+  int32_t Mower_GetRainSensorRaw() override;
+
+  bool Mower_IsCoverUiRainDetected() override {
+    // Only trust the rain flag while the panel is actually responding: the
+    // driver doesn't clear rain_detected_ when the UI goes unavailable, so a
+    // disconnected panel that last reported rain would otherwise latch it on.
+    return yf_cover_ui_.IsAvailable() && yf_cover_ui_.IsRainDetected();
+  }
+
  private:
   BQ2576 charger_{249000, 14040};
   xbot::driver::ui::YFCoverUI yf_cover_ui_{};
