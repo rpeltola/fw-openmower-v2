@@ -62,7 +62,11 @@ void MowerService::tick() {
     SendMowerStatus(static_cast<uint8_t>(esc_state_.status));
     SendMowerMotorTemperature(esc_state_.temperature_motor);
     SendMowerRunning(std::fabs(esc_state_.rpm) > 0);
-    SendMowerMotorRPM(esc_state_.rpm);
+    SendMowerMotorRPM(std::fabs(esc_state_.rpm));
+    // Actual motor direction reported by the ESC. Use esc_state_.direction, not
+    // the sign of rpm: rpm sign is not portable across drivers (e.g. YFR4esc
+    // reports an unsigned rpm). direction != 0 => reverse.
+    SendMowerMotorDirection(esc_state_.direction > 0.5f ? MowerDirection::REVERSE : MowerDirection::FORWARD);
   }
   CommitTransaction();
 
@@ -90,14 +94,13 @@ void MowerService::SetDuty() {
   duty_sent_ = true;
 }
 
-void MowerService::OnMowerEnabledChanged(const uint8_t& new_value) {
+void MowerService::OnMowerSpeedChanged(const float& new_value) {
   chMtxLock(&mtx);
   last_duty_received_micros_ = xbot::service::system::getTimeMicros();
-  if (new_value) {
-    mower_duty_ = 1.0;
-  } else {
-    mower_duty_ = 0;
-  }
+  // Commanded normalized speed/duty in [-1, 1]: sign = direction, magnitude =
+  // speed, 0 = off. Applied directly; any ramp on reversal is handled by the
+  // ESC's own duty ramp (and ROS goes through 0 between mow sessions).
+  mower_duty_ = new_value < -1.0f ? -1.0f : (new_value > 1.0f ? 1.0f : new_value);
   if (!duty_sent_) {
     SetDuty();
   }
