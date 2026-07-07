@@ -19,8 +19,9 @@ Real-time embedded firmware for the xCore board -- the low-level controller in t
 | Mow-motor direction | Honors commanded mow-motor speed and direction (replaces the boolean enable) | [#3](https://github.com/rpeltola/fw-openmower-v2/pull/3) · upstream [xtech#71](https://github.com/xtech/fw-openmower-v2/pull/71) |
 | Rain detection | ROS-configurable main-board rain sensor detection (threshold + value) | [#4](https://github.com/rpeltola/fw-openmower-v2/pull/4) |
 | Audio / filesystem RPC | `FilesystemService` + I2S `SoundService` for V2 board audio | [#5](https://github.com/rpeltola/fw-openmower-v2/pull/5) |
+| Meta service (versions) | Query interface for board + per-ESC firmware versions | _in progress — `feature/meta-service`_ |
 
-> **Note:** `xbot_framework` is pinned to the upstream-main version (`max_packet_size = 1500`). The newer framework lowers this to `1472`, which shrinks the per-service scratch buffer below what the diff-drive telemetry description needs — that limit must be resolved before PR #2's telemetry can land upstream.
+> **Note:** Uses `xbot_framework` with the corrected `max_packet_size = 1472` (real max UDP payload for a 1500-byte MTU). The static ESC firmware-version fields were removed from the diff-drive telemetry so its service description fits one packet; those versions move to the dedicated `MetaService` (query, not streamed) instead.
 
 ## Overview
 
