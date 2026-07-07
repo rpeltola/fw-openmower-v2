@@ -31,7 +31,7 @@ namespace xbot::driver::adc1 {
  *
  * Add new CG's as you like (your robot may have)
  */
-enum class Adc1ConversionId : uint8_t { V_CHARGER = 0, V_BATTERY, I_IN_DCDC, _NUM_CHANNEL_IDS };
+enum class Adc1ConversionId : uint8_t { V_CHARGER = 0, V_BATTERY, I_IN_DCDC, RAIN, _NUM_CHANNEL_IDS };
 
 enum class Resolution { BITS_16 = 0, BITS_14, BITS_12, BITS_10, BITS_8 };
 

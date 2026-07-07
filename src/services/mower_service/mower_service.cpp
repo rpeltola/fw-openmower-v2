@@ -7,6 +7,7 @@
 #include <cmath>
 #include <xbot-service/portable/system.hpp>
 
+#include "globals.hpp"
 #include "services.hpp"
 
 void MowerService::OnCreate() {
@@ -43,11 +44,26 @@ void MowerService::tick() {
 
   mower_driver_->RequestStatus();
 
-  // TODO: actually detect some rain
-  bool rain_detected = false;
+  // Rain detection: the platform's main-board analog sensor (threshold streamed
+  // from ROS; 0 = disabled) OR'd with an optional Cover UI.
+  const uint32_t rain_threshold = rain_threshold_.load();
+  const int32_t rain_raw = robot->Mower_GetRainSensorRaw();  // -1 if no main-board sensor
+  bool board_rain = false;
+  if (rain_raw >= 0 && rain_threshold > 0) {
+    board_rain = rain_detector_.Update(static_cast<uint16_t>(rain_raw), rain_threshold);
+  } else {
+    // No sensor or detection disabled: drop any latched state so a later
+    // re-enable starts from a clean, debounced state.
+    rain_detector_.Reset();
+  }
+  const bool rain_detected = board_rain || robot->Mower_IsCoverUiRainDetected();
 
   StartTransaction();
   SendRainDetected(rain_detected);
+  if (rain_raw >= 0) {
+    // Publish the live raw reading so the threshold can be set against it.
+    SendRainValue(static_cast<uint32_t>(rain_raw));
+  }
 
   // Check, if we have received ESC status updates recently. If not, send a disconnected message
   if (xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > 1'000'000 || !esc_state_valid_) {
@@ -102,6 +118,10 @@ void MowerService::OnMowerEnabledChanged(const uint8_t& new_value) {
     SetDuty();
   }
   chMtxUnlock(&mtx);
+}
+
+void MowerService::OnRainThresholdChanged(const uint32_t& new_value) {
+  rain_threshold_.store(new_value);
 }
 
 void MowerService::SetDriver(MotorDriver* motor_driver) {
