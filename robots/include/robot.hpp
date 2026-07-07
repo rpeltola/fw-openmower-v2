@@ -75,7 +75,7 @@ class Robot {
   }
 
   virtual ChargerDriver::ReChargeVoltage Power_GetDefaultReChargeVoltage() {
-    return ChargerDriver::ReChargeVoltage::PERCENT_97_6;
+    return ChargerDriver::ReChargeVoltage::PERCENT_94_3;
   }
 
   /**
@@ -104,6 +104,23 @@ class Robot {
     (void)uart;
     (void)baudrate;
     return true;
+  }
+
+  // --- Rain sensor (optional, platform-specific) ---
+
+  /**
+   * Return the raw ADC reading of the main-board rain sensor, or -1 if this
+   * platform has no main-board rain sensor.
+   */
+  virtual int32_t Mower_GetRainSensorRaw() {
+    return -1;
+  }
+
+  /**
+   * Return true if an attached Cover UI reports rain. Default: no Cover UI.
+   */
+  virtual bool Mower_IsCoverUiRainDetected() {
+    return false;
   }
 };
 
