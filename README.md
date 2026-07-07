@@ -6,6 +6,22 @@ Real-time embedded firmware for the xCore board -- the low-level controller in t
 [![CI](https://github.com/xtech/fw-openmower-v2/actions/workflows/ci.yaml/badge.svg)](https://github.com/xtech/fw-openmower-v2/actions/workflows/ci.yaml)
 [![Discord](https://img.shields.io/discord/958476543846412329?label=Discord&logo=discord)](https://discord.gg/jE7QNaSxW7)
 
+## Personal fork — extended features
+
+> **This is a downstream integration branch.** It tracks upstream [`xtech/fw-openmower-v2`](https://github.com/xtech/fw-openmower-v2) and adds the features below, each maintained as a standalone feature branch (and PR) so it can still be contributed upstream. This branch is the `--no-ff` merge of all of them; iterate on a feature's own branch, then re-merge here.
+>
+> Each feature also touches the shared [`definitions-open-mower`](https://github.com/rpeltola/definitions-open-mower) message definitions; the matching integrated defs live on that repo's `personal` branch (consumed as the `services` submodule).
+
+| Feature | What it adds | PR |
+|---|---|---|
+| ESC idle shutdown | Cuts ESC power when parked on level ground so the gate drivers can sleep | [#1](https://github.com/rpeltola/fw-openmower-v2/pull/1) |
+| Diff-drive speed control | Physical-units drive with an in-firmware duty speed loop + full ESC telemetry | [#2](https://github.com/rpeltola/fw-openmower-v2/pull/2) |
+| Mow-motor direction | Honors commanded mow-motor speed and direction (replaces the boolean enable) | [#3](https://github.com/rpeltola/fw-openmower-v2/pull/3) · upstream [xtech#71](https://github.com/xtech/fw-openmower-v2/pull/71) |
+| Rain detection | ROS-configurable main-board rain sensor detection (threshold + value) | [#4](https://github.com/rpeltola/fw-openmower-v2/pull/4) |
+| Audio / filesystem RPC | `FilesystemService` + I2S `SoundService` for V2 board audio | [#5](https://github.com/rpeltola/fw-openmower-v2/pull/5) |
+
+> **Note:** `xbot_framework` is pinned to the upstream-main version (`max_packet_size = 1500`). The newer framework lowers this to `1472`, which shrinks the per-service scratch buffer below what the diff-drive telemetry description needs — that limit must be resolved before PR #2's telemetry can land upstream.
+
 ## Overview
 
 [OpenMower](https://openmower.de) is an open-source project that converts off-the-shelf robotic lawn mowers into RTK-GPS-guided autonomous mowers -- eliminating the need for boundary wires. The system achieves centimeter-level positioning accuracy, supports multiple mowing zones, and provides a responsive web interface for control and scheduling.
