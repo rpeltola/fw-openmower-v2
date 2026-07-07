@@ -243,8 +243,6 @@ void DiffDriveService::ProcessStatusUpdate() {
   SendLeftESCMotorTemperature(left_esc_state_.temperature_motor);
   SendLeftESCTachoAbsolute(left_esc_state_.tacho_absolute);
   SendLeftESCDirection(static_cast<uint8_t>(left_esc_state_.direction));
-  SendLeftESCFWMajor(left_esc_state_.fw_major);
-  SendLeftESCFWMinor(left_esc_state_.fw_minor);
 
   SendRightESCRpm(right_esc_state_.rpm);
   SendRightESCDutyCycle(right_esc_state_.duty_cycle);
@@ -252,8 +250,6 @@ void DiffDriveService::ProcessStatusUpdate() {
   SendRightESCMotorTemperature(right_esc_state_.temperature_motor);
   SendRightESCTachoAbsolute(right_esc_state_.tacho_absolute);
   SendRightESCDirection(static_cast<uint8_t>(right_esc_state_.direction));
-  SendRightESCFWMajor(right_esc_state_.fw_major);
-  SendRightESCFWMinor(right_esc_state_.fw_minor);
 
   // Calculate the twist according to wheel ticks
   if (last_ticks_valid) {
