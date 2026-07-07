@@ -58,6 +58,10 @@ class VescDriver : public DebuggableDriver, public MotorDriver {
   static constexpr size_t RECV_BUFFER_SIZE = 260;
   uint32_t last_status_request_millis_ticks_ = 0;
 
+  // The ESC firmware version is static, so request it once (retry until the ESC
+  // answers, then stop). Set by ProcessPayload when a COMM_FW_VERSION arrives.
+  volatile bool fw_version_received_ = false;
+
   // Keep two buffers for streaming data while doing processing
   uint8_t recv_buffer1_[RECV_BUFFER_SIZE]{};
   uint8_t recv_buffer2_[RECV_BUFFER_SIZE]{};

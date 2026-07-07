@@ -5,6 +5,7 @@
 #include "pwm_motor_driver.hpp"
 
 #include <ch.h>
+#include <ulog.h>
 
 namespace xbot::driver::motor {
 
