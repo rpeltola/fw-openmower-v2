@@ -30,6 +30,11 @@ void DiffDriveService::SetDrivers(MotorDriver* left_driver, MotorDriver* right_d
   right_esc_driver_ = right_driver;
 }
 
+bool DiffDriveService::IsHealthy() {
+  // Intentional ESC power-off (idle on the dock) is healthy, not a fault.
+  return power_service.EscPowerIsOff() || (IsRunning() && (escs_connected_.load() == (ESC_LEFT | ESC_RIGHT)));
+}
+
 bool DiffDriveService::OnStart() {
   // Check, if configuration is valid, if not retry
   if (WheelDistance.value == 0) {
@@ -78,7 +83,9 @@ void DiffDriveService::tick() {
     speed_l_ = speed_r_ = 0;
   }
 
-  if (!duty_sent_) {
+  // Stop commanding while power_service is intentionally idling the ESCs, so the
+  // xESC command-timeout releases the motor and the gate driver can sleep.
+  if (!duty_sent_ && !power_service.EscPowerIsOff()) {
     SetDuty();
   }
 
@@ -87,12 +94,15 @@ void DiffDriveService::tick() {
 
   // Check, if we have received ESC status updates recently. If not, send a disconnected message
   if (xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > 1'000'000) {
+    const auto no_data_status = power_service.EscPowerIsOff()
+                                    ? MotorDriver::ESCState::ESCStatus::ESC_STATUS_POWERED_OFF
+                                    : MotorDriver::ESCState::ESCStatus::ESC_STATUS_DISCONNECTED;
     StartTransaction();
     if (!left_esc_state_valid_) {
-      SendLeftESCStatus(static_cast<uint8_t>(MotorDriver::ESCState::ESCStatus::ESC_STATUS_DISCONNECTED));
+      SendLeftESCStatus(static_cast<uint8_t>(no_data_status));
     }
     if (!right_esc_state_valid_) {
-      SendRightESCStatus(static_cast<uint8_t>(MotorDriver::ESCState::ESCStatus::ESC_STATUS_DISCONNECTED));
+      SendRightESCStatus(static_cast<uint8_t>(no_data_status));
     }
     CommitTransaction();
   }

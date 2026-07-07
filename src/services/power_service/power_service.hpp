@@ -59,6 +59,13 @@ class PowerService : public PowerServiceBase {
     return dcdc_current_;
   }
 
+  // True when the firmware has cut power to the ESCs (idle on the dock, level
+  // ground). diff_drive/mower read this to report ESC_STATUS_POWERED_OFF and to
+  // stay healthy while the ESCs are intentionally off. Lock-free (atomic).
+  [[nodiscard]] bool EscPowerIsOff() const {
+    return esc_power_off_.load();
+  }
+
   [[nodiscard]] float GetAdcAdapterVolts() {
     xbot::service::Lock lk{&mtx_};
     return adapter_volts_adc_;
@@ -98,6 +105,7 @@ class PowerService : public PowerServiceBase {
   void driver_tick_();
   void update_charger_();
   void read_adc_();
+  void update_esc_power_();
 
   ServiceSchedule tick_schedule_{*this, 1'000'000,
                                  XBOT_FUNCTION_FOR_METHOD(PowerService, &PowerService::service_tick_, this)};
@@ -105,6 +113,8 @@ class PowerService : public PowerServiceBase {
                             XBOT_FUNCTION_FOR_METHOD(PowerService, &PowerService::driver_tick_, this)};
 
   etl::atomic<bool> charger_configured_{false};
+  etl::atomic<bool> esc_power_off_{false};
+  uint8_t esc_block_reason_ = 0xFF;  // last-logged reason the ESC power-cut is held off (edge-triggered)
   float charge_current_ = 0;
   float adapter_volts_ = 0;
   float battery_volts_ = 0;

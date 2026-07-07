@@ -75,9 +75,9 @@ class MowerService : public MowerServiceBase {
 
   void OnEmergencyChangedEvent();
 
-  bool IsHealthy() override {
-    return IsRunning() && esc_ever_connected_;
-  }
+  // Defined in the .cpp so it can consult power_service (intentional ESC
+  // power-off is healthy, not a fault).
+  bool IsHealthy() override;
 
  protected:
   void OnCreate() override;
