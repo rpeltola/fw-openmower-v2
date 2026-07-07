@@ -25,6 +25,13 @@ class ImuService : public ImuServiceBase {
     return imu_found;
   }
 
+  // Absolute pitch/tilt angle from horizontal in degrees, derived from the
+  // accelerometer. Returns the angle between the gravity vector and the
+  // robot's vertical (z) axis, so it is independent of heading on a slope.
+  float GetPitch() const {
+    return pitch_deg_.load();
+  }
+
   bool IsHealthy() override {
     return IsRunning() && imu_found;
   }
@@ -35,6 +42,7 @@ class ImuService : public ImuServiceBase {
 
  private:
   etl::atomic<bool> imu_found{false};
+  etl::atomic<float> pitch_deg_{0.0f};
   etl::string<255> error_message{};
 
   int16_t data_raw_acceleration[3];

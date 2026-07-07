@@ -8,6 +8,7 @@
 #include <lsm6ds3tr-c_reg.h>
 #include <ulog.h>
 
+#include <cmath>
 #include <xbot-service/portable/system.hpp>
 
 static SPIConfig spi_config = {
@@ -134,6 +135,11 @@ void ImuService::tick() {
     axes[0] = axis_remap_sign_[0] * lsm6ds3tr_c_from_fs2g_to_mg(data_raw_acceleration[axis_remap_idx_[0]]) * 0.00980665;
     axes[1] = axis_remap_sign_[1] * lsm6ds3tr_c_from_fs2g_to_mg(data_raw_acceleration[axis_remap_idx_[1]]) * 0.00980665;
     axes[2] = axis_remap_sign_[2] * lsm6ds3tr_c_from_fs2g_to_mg(data_raw_acceleration[axis_remap_idx_[2]]) * 0.00980665;
+
+    // Tilt from horizontal: angle between the gravity vector and the vertical
+    // (z) axis. Independent of heading, so it covers pitch and roll on a slope.
+    const float horizontal = sqrtf(static_cast<float>(axes[0] * axes[0] + axes[1] * axes[1]));
+    pitch_deg_ = atan2f(horizontal, fabsf(static_cast<float>(axes[2]))) * 180.0f / static_cast<float>(M_PI);
   }
 
   if (reg.status_reg.gda) {

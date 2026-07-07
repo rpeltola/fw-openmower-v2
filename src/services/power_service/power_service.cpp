@@ -9,11 +9,20 @@
 #include <cstdio>
 #include <cstring>
 #include <globals.hpp>
+#include <services.hpp>
 
 #include "board.h"
 #include "drivers/adc/adc1.hpp"
 
 using namespace xbot::driver;
+
+namespace {
+// The xESC SHUTDOWN line (GPIO0/PD4, shared by all three ESCs) is active-low:
+// driving it low powers the ESCs off. The boot default is high-Z (held at the
+// "on" level on the ESC side), so the ESCs are powered unless we drive this.
+constexpr int ESC_SHUTDOWN_OFF_LEVEL = PAL_HIGH;  // drive high to idle the ESC; low = run (safe default)
+constexpr int ESC_SHUTDOWN_ON_LEVEL = PAL_LOW;
+}  // namespace
 
 // Static assertions to ensure ChargerDriver::ReChargeVoltage enum matches PowerService ReChargeVoltages enum
 static_assert(static_cast<uint8_t>(ChargerDriver::ReChargeVoltage::PERCENT_93_0) == 0, "ReChargeVoltage enum mismatch");
@@ -65,6 +74,65 @@ void PowerService::service_tick_() {
   SendDCDCInputCurrent(dcdc_current_);
 
   CommitTransaction();
+
+  update_esc_power_();
+}
+
+void PowerService::update_esc_power_() {
+  // ESC idle power-cut: when parked (high-level IDLE) on level ground, idle all
+  // three xESCs via GPIO0/PD4 so they cool down - the motors are not needed while
+  // idle. Leaving IDLE restores power, giving the xESCs time to wake before moving.
+  // Pitch-gated because a released drive motor has no holding torque, so this is
+  // only safe on (near) level ground.
+  const uint8_t max_pitch = ShutdownESCMaxPitch.value;
+  const bool idle = high_level_service.GetStateId() == HighLevelStatus::IDLE;
+  const bool imu_ok = imu_service.IsFound();
+  const float pitch = imu_service.GetPitch();
+  const bool ready = max_pitch != 0 && idle && imu_ok && pitch <= static_cast<float>(max_pitch);
+
+  // Edge-triggered diagnostic: when the cut is held off, log the (first) blocking
+  // reason whenever it changes, so it is clear why the ESCs stay powered.
+  // reason 0 = ready (the cut/restore action below logs that case).
+  uint8_t reason;
+  if (max_pitch == 0) {
+    reason = 1;
+  } else if (!idle) {
+    reason = 2;
+  } else if (!imu_ok) {
+    reason = 3;
+  } else if (pitch > static_cast<float>(max_pitch)) {
+    reason = 4;
+  } else {
+    reason = 0;
+  }
+  if (reason != esc_block_reason_) {
+    esc_block_reason_ = reason;
+    switch (reason) {
+      case 1: ULOG_ARG_INFO(&service_id_, "ESC power-cut disabled (shutdown_esc_max_pitch=0)"); break;
+      case 2: ULOG_ARG_INFO(&service_id_, "ESC power-cut held off: high-level not IDLE"); break;
+      case 3: ULOG_ARG_INFO(&service_id_, "ESC power-cut held off: IMU not available"); break;
+      case 4:
+        ULOG_ARG_INFO(&service_id_, "ESC power-cut held off: tilt %d > limit %u deg", static_cast<int>(pitch),
+                      static_cast<unsigned>(max_pitch));
+        break;
+      default: break;  // reason 0 (ready): the cut action logs it
+    }
+  }
+
+  // Drive the shutdown line: high = idle the xESCs, low = run. A custom xESC
+  // sleeps its gate driver on this line; a stock xESC releases via its kill
+  // switch (the default app config wires it here), so this degrades gracefully.
+  palSetLineMode(LINE_GPIO0, PAL_MODE_OUTPUT_PUSHPULL);
+  palWriteLine(LINE_GPIO0, ready ? ESC_SHUTDOWN_OFF_LEVEL : ESC_SHUTDOWN_ON_LEVEL);
+  if (ready != esc_power_off_) {
+    esc_power_off_ = ready;
+    if (ready) {
+      ULOG_ARG_INFO(&service_id_, "ESC power cut (idle, tilt %d deg <= %u); ESCs off to cool",
+                    static_cast<int>(imu_service.GetPitch()), static_cast<unsigned>(max_pitch));
+    } else {
+      ULOG_ARG_INFO(&service_id_, "ESC power restored");
+    }
+  }
 }
 
 void PowerService::driver_tick_() {
