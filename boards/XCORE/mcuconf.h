@@ -422,6 +422,19 @@
 #define STM32_SPI_DMA_ERROR_HOOK(spip)      osalSysHalt("DMA failure")
 
 /*
+ * BDMA (BDMA1/DMAMUX2) shared helper driver.
+ * STM32_SPI_USE_SPI6 is FALSE above: SPI6/I2S6 is driven by a custom register-level driver
+ * (src/drivers/audio/i2s6_audio.cpp) instead of the ChibiOS SPI/I2S HAL, since SPI6 is in the D3
+ * power domain and can only be reached via BDMA1 (through DMAMUX2), which the stock I2S HAL
+ * (SPIv1/SPIv2, DMA1/DMA2 only) doesn't support. That driver still needs ChibiOS's generic BDMA
+ * helper (stm32_bdma.c: bdmaStreamAlloc/bdmaSetRequestSource/...) compiled in, which is normally
+ * pulled in automatically by hal_i2c_lld.h only when STM32_I2C_USE_DMA == TRUE - and this board
+ * sets that FALSE (I2C runs interrupt/polled). Request it explicitly instead of flipping I2C's
+ * DMA mode just as a side effect.
+ */
+#define STM32_BDMA_REQUIRED
+
+/*
  * ST driver system settings.
  */
 #define STM32_ST_IRQ_PRIORITY               8
