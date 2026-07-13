@@ -24,6 +24,10 @@ void YardForceRobot::InitPlatform() {
   if (!adc1::Start()) {
     ULOG_ERROR("YardForce: ADC1 start failed; main-board rain sensor unavailable");
   }
+
+  // Enable aux power supply
+  palSetLineMode(LINE_GPIO4, PAL_MODE_OUTPUT_PUSHPULL);
+  palSetLine(LINE_GPIO4);
 }
 
 int32_t YardForceRobot::Mower_GetRainSensorRaw() {
