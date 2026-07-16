@@ -64,19 +64,21 @@ class DiffDriveService : public DiffDriveServiceBase {
   float last0_v_ = 0, last1_v_ = 0;
   float last0_w_ = 0, last1_w_ = 0;
   // Velocity limits act as a safety cap; max angular = 2*v_max/track for in-place spins.
-  // Acceleration/jerk limiting is DISABLED for now so the transient response matches the
-  // pre-physical firmware exactly (the FTC planner is not tuned for command ramping). The
-  // accel limits stay here to enable + tune later as a smoothing step.
-  static constexpr float kMaxLinVelMps = 0.6f;   // m/s
-  static constexpr float kMaxLinAccMps2 = 0.5f;  // m/s^2  (unused while accel limiting off)
-  static constexpr float kMaxAngVelRps = 3.0f;   // rad/s
-  static constexpr float kMaxAngAccRps2 = 2.0f;  // rad/s^2 (unused while accel limiting off)
-  SpeedLimiter limiter_lin_{true,           false, false, -kMaxLinVelMps, kMaxLinVelMps, -kMaxLinAccMps2,
-                            kMaxLinAccMps2, 0.0f,  0.0f};
-  SpeedLimiter limiter_ang_{true,           false, false, -kMaxAngVelRps, kMaxAngVelRps, -kMaxAngAccRps2,
-                            kMaxAngAccRps2, 0.0f,  0.0f};
-  // tick() period [s], must match tick_schedule_ (40 ms). Used as dt for the limiter.
-  static constexpr float kTickPeriodS = 0.04f;
+  // Acceleration limiting shapes the SETPOINT: with the feedforward in place the duty now
+  // jumps on a command step, so the ramp belongs on the target, not on the output. The
+  // limits sit above the ROS velocity_smoother's (2.5 / 3.2), so they never bind during
+  // normal navigation - they exist to protect direct /ll/cmd_vel writers (drive_tune, joy).
+  // The linear limit is runtime-settable via the Accel Limit register (see kAccelLimitMps2).
+  static constexpr float kMaxLinVelMps = 0.6f;    // m/s
+  static constexpr float kAccelLimitMps2 = 3.0f;  // m/s^2, built-in when Accel Limit <= 0
+  static constexpr float kMaxAngVelRps = 3.0f;    // rad/s
+  static constexpr float kMaxAngAccRps2 = 4.0f;   // rad/s^2
+  SpeedLimiter limiter_lin_{true, true, false, -kMaxLinVelMps, kMaxLinVelMps, -kAccelLimitMps2, kAccelLimitMps2,
+                            0.0f, 0.0f};
+  SpeedLimiter limiter_ang_{true,           true, false, -kMaxAngVelRps, kMaxAngVelRps, -kMaxAngAccRps2,
+                            kMaxAngAccRps2, 0.0f, 0.0f};
+  // tick() period [s], must match tick_schedule_ (20 ms). Used as dt for the limiter.
+  static constexpr float kTickPeriodS = 0.02f;
 
   // --- Firmware speed loop (duty_loop) --------------------------------------
   // Per-wheel target wheel speed [m/s] from the inverse kinematics. Right wheel is
@@ -86,14 +88,14 @@ class DiffDriveService : public DiffDriveServiceBase {
   // PI integrator state, in actuator units (duty or amps).
   float integ_l_ = 0;
   float integ_r_ = 0;
-  // Low-pass filtered measured wheel speed [m/s] (coarse 25 Hz tacho is noisy at low
-  // speed; filtering stops the loop chasing quantization).
+  // Low-pass filtered measured wheel speed [m/s]. The feedback is the ESC's own eRPM,
+  // which is already filtered, so this only takes the last of the noise off.
   float meas_filt_l_ = 0;
   float meas_filt_r_ = 0;
-  // Previous actuator output, for slew-rate limiting (ramps through breakaway and caps
-  // the dump on overshoot -> kills the stick-slip surge).
-  float out_prev_l_ = 0;
-  float out_prev_r_ = 0;
+  // Previous PI term, for slew-rate limiting. Only the PI term is slewed - the
+  // feedforward must be free to jump on a command step.
+  float pi_prev_l_ = 0;
+  float pi_prev_r_ = 0;
   // Built-in per-mode gains, used when the Loop Kp/Ki/Max registers are left at their
   // "unset" sentinel (Kp/Ki < 0, Max <= 0). Field-tune live via those registers
   // (ll/services/diff_drive/loop_kp etc.) without reflashing. These defaults are sized
@@ -101,26 +103,53 @@ class DiffDriveService : public DiffDriveServiceBase {
   // duty_loop: output is duty [-1,1]; breakaway is ~0.16 duty on grass.
   static constexpr float kDutyLoopKp = 2.0f;  // duty per (m/s of error)
   static constexpr float kDutyLoopKi = 6.0f;  // duty per (m/s of error * s)
+  // Feedforward: duty = ks*sign(target) + kv*target. ks is the static-friction (breakaway)
+  // term and stays 0 until it is characterized on the robot; kv is the inverse of the
+  // open-loop duty->speed gain, i.e. the same 1/kMaxWheelSpeedMps map the open-loop mode
+  // uses, so duty_loop starts out at least as strong as open loop and the PI only trims.
+  static constexpr float kDutyLoopKs = 0.0f;  // duty
+  static constexpr float kDutyLoopKv = 2.0f;  // duty per (m/s)
 
   // Measured-speed low-pass filter coefficient (EMA): filt += alpha * (meas - filt).
-  // Lower = smoother but more lag. ~0.3 tames tacho quantization without much lag.
-  static constexpr float kMeasFilterAlpha = 0.3f;
-  // Built-in output slew-rate limits [actuator units per second], used when the Loop
-  // Slew register is <= 0. Ramps the command through breakaway and caps the overshoot
-  // dump, converting the stick-slip surge into a smooth creep.
+  // Lower = smoother but more lag.
+  static constexpr float kMeasFilterAlpha = 0.5f;
+  // Built-in slew-rate limit for the PI term [duty per second], used when the Loop Slew
+  // register is <= 0. Caps how fast the correction can move, so an overshoot cannot be
+  // dumped in one cycle; the feedforward is not slewed.
   static constexpr float kDutyLoopSlew = 3.0f;  // duty per second
   // Tolerance band: within this speed error we command no correction, to avoid
   // hunting on the coarse low-speed hall feedback. Keep this WELL below the slowest
   // wheel speed we want to hold, or slow commands get swallowed and never drive.
   static constexpr float kSpeedDeadbandMps = 0.005f;
 
-  // Runs one per-wheel PI step. Returns the actuator command (duty or amps),
-  // clamped to +/-out_max, updated at no more than max_slew per second from prev_out,
-  // and updates the integrator/prev_out in-place (with anti-windup). measured_v should
-  // be the filtered wheel speed. A near-zero target cleanly stops (output 0, integrator
-  // and slew memory reset) rather than holding torque at standstill.
-  static float RunSpeedLoop(float target_v, float measured_v, float &integ, float &prev_out, float kp, float ki,
-                            float out_max, float max_slew, float dt);
+  // Live gain overrides from the Loop Tuning input. Negative = not overridden, fall back
+  // to the register (and, if that is at its sentinel, to the built-in). A register write
+  // restarts the service, which clears these - the last full reconfigure wins.
+  float tune_kp_ = -1;
+  float tune_ki_ = -1;
+  float tune_ks_ = -1;
+  float tune_kv_ = -1;
+  float tune_out_max_ = -1;
+  float tune_slew_ = -1;
+
+  // Control Debug flag bits (output id20, element 9).
+  static constexpr uint16_t kFlagSatLeft = 1 << 0;
+  static constexpr uint16_t kFlagSatRight = 1 << 1;
+  static constexpr uint16_t kFlagSlewLeft = 1 << 2;
+  static constexpr uint16_t kFlagSlewRight = 1 << 3;
+  static constexpr uint16_t kFlagDutyLoop = 1 << 4;
+
+  // Runs one per-wheel feedforward + PI step. Returns the duty command, clamped to
+  // +/-out_max. The feedforward (ks*sign(target) + kv*target) is applied directly; only
+  // the PI term is slew-limited (max_slew per second) so a command step still gets its
+  // full feedforward immediately. The integrator uses conditional integration: it only
+  // integrates while the output is unsaturated or the error points out of saturation.
+  // measured_v should be the filtered wheel speed. A near-zero target cleanly stops
+  // (output 0, integrator and slew memory reset) rather than holding torque at standstill.
+  // saturated/slew_limited report which limits bound this step, for the debug frame.
+  static float RunSpeedLoop(float target_v, float measured_v, float &integ, float &prev_pi, float kp, float ki,
+                            float ks, float kv, float out_max, float max_slew, float dt, bool &saturated,
+                            bool &slew_limited);
 
  public:
   explicit DiffDriveService(uint16_t service_id) : DiffDriveServiceBase(service_id, wa, sizeof(wa)) {
@@ -141,7 +170,7 @@ class DiffDriveService : public DiffDriveServiceBase {
 
  private:
   void tick();
-  ServiceSchedule tick_schedule_{*this, 40'000,
+  ServiceSchedule tick_schedule_{*this, 20'000,
                                  XBOT_FUNCTION_FOR_METHOD(DiffDriveService, &DiffDriveService::tick, this)};
 
   // Apply the SpeedLimiter to the commanded twist and run the inverse kinematics to
@@ -163,6 +192,7 @@ class DiffDriveService : public DiffDriveServiceBase {
 
  protected:
   void OnControlTwistChanged(const double *new_value, uint32_t length) override;
+  void OnLoopTuningChanged(const double *new_value, uint32_t length) override;
 };
 
 #endif  // DIFF_DRIVE_SERVICE_HPP
