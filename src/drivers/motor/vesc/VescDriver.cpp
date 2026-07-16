@@ -92,7 +92,12 @@ void VescDriver::ProcessPayload() {
       latest_state_.tacho_absolute =
           buffer_get_int32(message,
                            &index);  // 4 bytes - mc_interface_get_tachometer_abs_value(false)
-      latest_state_.status = static_cast<mc_fault_code>(message[index++]) != FAULT_CODE_NONE
+      // Keep the fault code, not just the fact that there was one: it names the cause
+      // (over-temp FET, DRV, over-current, ...) and it is the only place that knowledge
+      // exists. The status still collapses to OK/ERROR - it is the lifecycle, and its
+      // consumers act on that, so the cause travels beside it rather than inside it.
+      latest_state_.fault_code = message[index++];
+      latest_state_.status = static_cast<mc_fault_code>(latest_state_.fault_code) != FAULT_CODE_NONE
                                  ? ESCState::ESCStatus::ESC_STATUS_ERROR
                                  : ESCState::ESCStatus::ESC_STATUS_OK;
       index += 4;  // 4 bytes - mc_interface_get_pid_pos_now()

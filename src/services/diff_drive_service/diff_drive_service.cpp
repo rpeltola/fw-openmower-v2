@@ -34,11 +34,16 @@ void DiffDriveService::ResetControlState() {
   speed_l_ = speed_r_ = 0;
   integ_l_ = integ_r_ = 0;
   meas_filt_l_ = meas_filt_r_ = 0;
-  out_prev_l_ = out_prev_r_ = 0;
+  pi_prev_l_ = pi_prev_r_ = 0;
 }
 void DiffDriveService::UpdateCommand(float dt) {
   // Shape the commanded twist with velocity/acceleration limits (diff_drive_controller
   // SpeedLimiter), tracking the last two limited commands per axis for jerk limiting.
+  // The linear acceleration limit is runtime-settable (Accel Limit register, <= 0 keeps
+  // the built-in).
+  const float accel_limit = AccelLimit.value > 0.0f ? AccelLimit.value : kAccelLimitMps2;
+  limiter_lin_.max_acceleration = accel_limit;
+  limiter_lin_.min_acceleration = -accel_limit;
   float v = cmd_v_;
   float w = cmd_w_;
   limiter_lin_.limit(v, last0_v_, last1_v_, dt);
@@ -90,6 +95,9 @@ bool DiffDriveService::OnStart() {
   }
 
   ResetControlState();
+  // A configuration transaction restarts the service, so any live Loop Tuning override
+  // is dropped here: the newest full reconfigure wins over an older live tune.
+  tune_kp_ = tune_ki_ = tune_ks_ = tune_kv_ = tune_out_max_ = tune_slew_ = -1.0f;
   last_ticks_valid = false;
   return true;
 }
@@ -170,45 +178,61 @@ void DiffDriveService::SendMotorCommand() {
   command_sent_ = true;
 }
 
-float DiffDriveService::RunSpeedLoop(float target_v, float measured_v, float& integ, float& prev_out, float kp,
-                                     float ki, float out_max, float max_slew, float dt) {
+float DiffDriveService::RunSpeedLoop(float target_v, float measured_v, float& integ, float& prev_pi, float kp, float ki,
+                                     float ks, float kv, float out_max, float max_slew, float dt, bool& saturated,
+                                     bool& slew_limited) {
+  saturated = false;
+  slew_limited = false;
   // Clean stop: don't hold torque against a standstill (avoids energizing/heating
   // the ESC and low-speed hunting when the mower is meant to be still).
   if (target_v > -1e-3f && target_v < 1e-3f) {
     integ = 0.0f;
-    prev_out = 0.0f;
+    prev_pi = 0.0f;
     return 0.0f;
   }
+  // Feedforward: the duty the wheel is expected to need at this speed. This is what
+  // gets the wheel moving; the PI only trims what the model gets wrong.
+  const float ff = (target_v > 0.0f ? ks : -ks) + kv * target_v;
+
   float err = target_v - measured_v;
   // Tolerance band around the target.
   if (err < kSpeedDeadbandMps && err > -kSpeedDeadbandMps) {
     err = 0.0f;
   }
-  // Integrate, then clamp the integrator itself for anti-windup.
-  integ += ki * err * dt;
-  if (integ > out_max) {
-    integ = out_max;
-  } else if (integ < -out_max) {
-    integ = -out_max;
+  // Conditional integration (anti-windup): integrate only while the output is off the
+  // rail, or while the error is pushing back off it. Clamping the integrator instead
+  // would let it sit wound up against a rail and overshoot on release.
+  const float out_pre = ff + kp * err + integ;
+  const bool sat_hi = out_pre > out_max;
+  const bool sat_lo = out_pre < -out_max;
+  if ((!sat_hi && !sat_lo) || (sat_hi && err < 0.0f) || (sat_lo && err > 0.0f)) {
+    integ += ki * err * dt;
   }
-  float out = kp * err + integ;
-  if (out > out_max) {
-    out = out_max;
-  } else if (out < -out_max) {
-    out = -out_max;
-  }
-  // Slew-rate limit: cap how fast the command can change per cycle. This ramps the
-  // output through breakaway and caps the dump on overshoot, turning the stick-slip
-  // surge into a smooth creep.
+
+  float pi = kp * err + integ;
+  // Slew-rate limit the PI TERM ONLY: the feedforward must be free to jump on a command
+  // step (the setpoint accel limit shapes that), while the correction stays smooth so a
+  // stick-slip overshoot cannot be dumped in one cycle.
   if (max_slew > 0.0f) {
     const float max_delta = max_slew * dt;
-    if (out > prev_out + max_delta) {
-      out = prev_out + max_delta;
-    } else if (out < prev_out - max_delta) {
-      out = prev_out - max_delta;
+    if (pi > prev_pi + max_delta) {
+      pi = prev_pi + max_delta;
+      slew_limited = true;
+    } else if (pi < prev_pi - max_delta) {
+      pi = prev_pi - max_delta;
+      slew_limited = true;
     }
   }
-  prev_out = out;
+  prev_pi = pi;
+
+  float out = ff + pi;
+  if (out > out_max) {
+    out = out_max;
+    saturated = true;
+  } else if (out < -out_max) {
+    out = -out_max;
+    saturated = true;
+  }
   return out;
 }
 
@@ -246,20 +270,22 @@ void DiffDriveService::ProcessStatusUpdate() {
   SendRightESCCurrent(right_esc_state_.current_input);
   SendRightESCStatus(static_cast<uint8_t>(right_esc_state_.status));
 
-  // Forward the remaining ESC telemetry already parsed into ESCState.
+  // Forward the remaining ESC telemetry already parsed into ESCState. Two fields are
+  // deliberately NOT sent, because the description must fit one advertise datagram and
+  // the fault cause earns their bytes: Direction (it is sign(rpm), which the consumer can
+  // derive just as the VESC driver does) and Tacho Absolute (an accumulator nothing
+  // computes with - the odometry-bearing count is Wheel Ticks, sent below).
   SendLeftESCRpm(left_esc_state_.rpm);
   SendLeftESCDutyCycle(left_esc_state_.duty_cycle);
   SendLeftESCInputVoltage(left_esc_state_.voltage_input);
   SendLeftESCMotorTemperature(left_esc_state_.temperature_motor);
-  SendLeftESCTachoAbsolute(left_esc_state_.tacho_absolute);
-  SendLeftESCDirection(static_cast<uint8_t>(left_esc_state_.direction));
+  SendLeftESCFaultCode(left_esc_state_.fault_code);
 
   SendRightESCRpm(right_esc_state_.rpm);
   SendRightESCDutyCycle(right_esc_state_.duty_cycle);
   SendRightESCInputVoltage(right_esc_state_.voltage_input);
   SendRightESCMotorTemperature(right_esc_state_.temperature_motor);
-  SendRightESCTachoAbsolute(right_esc_state_.tacho_absolute);
-  SendRightESCDirection(static_cast<uint8_t>(right_esc_state_.direction));
+  SendRightESCFaultCode(right_esc_state_.fault_code);
 
   // Calculate the twist according to wheel ticks
   if (last_ticks_valid) {
@@ -278,24 +304,66 @@ void DiffDriveService::ProcessStatusUpdate() {
     ticks[1] = right_esc_state_.tacho;
     SendWheelTicks(ticks, 2);
 
-    // Firmware speed loop: close a per-wheel PI on measured wheel speed. Runs at
-    // the ESC telemetry rate (dt from the tacho window). Per-wheel measured speed
-    // is in the same (mirrored) frame as target_v_l_/target_v_r_.
+    // Firmware speed loop: close a per-wheel feedforward+PI on measured wheel speed.
+    // Runs at the ESC telemetry rate (dt from the status window).
     if (ControlMode.value == kControlModeDutyLoop) {
-      const float meas_v_l = static_cast<float>(d_left) / (dt * static_cast<float>(WheelTicksPerMeter.value));
-      const float meas_v_r = static_cast<float>(d_right) / (dt * static_cast<float>(WheelTicksPerMeter.value));
+      // Feedback is the ESC's own eRPM, not the tacho delta: the tacho only ticks 6 times
+      // per electrical revolution, so over one window it quantizes the speed far too
+      // coarsely to close a loop at walking pace. eRPM/60 elec-rev/s * 6 ticks/elec-rev
+      // = eRPM/10 ticks/s; divided by ticks-per-meter that is m/s, with the pole pairs
+      // cancelling out. The sign convention is the ESC's own, i.e. the same one the tacho
+      // delta above uses, so the mirrored right wheel needs no extra negation (its target
+      // is already mirrored to match).
+      // Odometry (Actual Twist / Wheel Ticks) deliberately stays tacho-based.
+      const float meas_v_l = left_esc_state_.rpm * 0.1f / static_cast<float>(WheelTicksPerMeter.value);
+      const float meas_v_r = right_esc_state_.rpm * 0.1f / static_cast<float>(WheelTicksPerMeter.value);
       // Low-pass the measured speed before the loop sees it (EMA).
       meas_filt_l_ += kMeasFilterAlpha * (meas_v_l - meas_filt_l_);
       meas_filt_r_ += kMeasFilterAlpha * (meas_v_r - meas_filt_r_);
-      // Registers override the built-in gains/slew when set (sentinel: Kp/Ki < 0, Max/Slew <= 0),
-      // so they can be tuned live via ll/services/diff_drive/loop_kp etc.
-      const float kp = LoopKp.value >= 0.0f ? LoopKp.value : kDutyLoopKp;
-      const float ki = LoopKi.value >= 0.0f ? LoopKi.value : kDutyLoopKi;
-      const float out_max = LoopMaxOutput.value > 0.0f ? LoopMaxOutput.value : 1.0f;
-      const float max_slew = LoopSlew.value > 0.0f ? LoopSlew.value : kDutyLoopSlew;
-      speed_l_ = RunSpeedLoop(target_v_l_, meas_filt_l_, integ_l_, out_prev_l_, kp, ki, out_max, max_slew, dt);
-      speed_r_ = RunSpeedLoop(target_v_r_, meas_filt_r_, integ_r_, out_prev_r_, kp, ki, out_max, max_slew, dt);
+      // Gain resolution, in order: Loop Tuning input (live, negative = not set) overrides
+      // the register (sentinel: Kp/Ki/Ks/Kv < 0, Max/Slew <= 0), which overrides the
+      // built-in. So gains can be tuned live via the input, or set per-robot via
+      // ll/services/diff_drive/loop_kp etc.
+      const float kp = tune_kp_ >= 0.0f ? tune_kp_ : (LoopKp.value >= 0.0f ? LoopKp.value : kDutyLoopKp);
+      const float ki = tune_ki_ >= 0.0f ? tune_ki_ : (LoopKi.value >= 0.0f ? LoopKi.value : kDutyLoopKi);
+      const float ks = tune_ks_ >= 0.0f ? tune_ks_ : (LoopKs.value >= 0.0f ? LoopKs.value : kDutyLoopKs);
+      const float kv = tune_kv_ >= 0.0f ? tune_kv_ : (LoopKv.value >= 0.0f ? LoopKv.value : kDutyLoopKv);
+      const float out_max =
+          tune_out_max_ > 0.0f ? tune_out_max_ : (LoopMaxOutput.value > 0.0f ? LoopMaxOutput.value : 1.0f);
+      const float max_slew = tune_slew_ > 0.0f ? tune_slew_ : (LoopSlew.value > 0.0f ? LoopSlew.value : kDutyLoopSlew);
+      // Bound the loop's dt. If an ESC goes quiet for a while (UART glitch) but the twist
+      // keeps arriving, so the 1 s hard-stop never fires, the next status pair would
+      // otherwise integrate that whole gap in one step and make the PI slew limit useless
+      // for exactly the cycle that needs it - the wheel would jump on reconnect. The
+      // odometry above deliberately keeps the true dt: a real gap IS slower motion.
+      const float loop_dt = dt < kMinLoopDtS ? kMinLoopDtS : (dt > kMaxLoopDtS ? kMaxLoopDtS : dt);
+      bool sat_l = false, sat_r = false, slew_l = false, slew_r = false;
+      speed_l_ = RunSpeedLoop(target_v_l_, meas_filt_l_, integ_l_, pi_prev_l_, kp, ki, ks, kv, out_max, max_slew,
+                              loop_dt, sat_l, slew_l);
+      speed_r_ = RunSpeedLoop(target_v_r_, meas_filt_r_, integ_r_, pi_prev_r_, kp, ki, ks, kv, out_max, max_slew,
+                              loop_dt, sat_r, slew_r);
       SendMotorCommand();
+
+      // Debug frame for the tuning harness: everything needed to reconstruct one loop
+      // iteration, stamped with the firmware clock so it can be aligned without guessing
+      // at transport latency.
+      uint16_t flags = kFlagDutyLoop;
+      if (sat_l) flags |= kFlagSatLeft;
+      if (sat_r) flags |= kFlagSatRight;
+      if (slew_l) flags |= kFlagSlewLeft;
+      if (slew_r) flags |= kFlagSlewRight;
+      double debug[10];
+      debug[0] = static_cast<double>(micros) * 1e-6;
+      debug[1] = target_v_l_;
+      debug[2] = target_v_r_;
+      debug[3] = meas_filt_l_;
+      debug[4] = meas_filt_r_;
+      debug[5] = speed_l_;
+      debug[6] = speed_r_;
+      debug[7] = integ_l_;
+      debug[8] = integ_r_;
+      debug[9] = flags;
+      SendControlDebug(debug, 10);
     }
   }
   last_ticks_valid = true;
@@ -317,5 +385,23 @@ void DiffDriveService::OnControlTwistChanged(const double* new_value, uint32_t l
   // fixed rate (so the limiter's dt is consistent) and dispatches the command.
   cmd_v_ = static_cast<float>(new_value[0]);
   cmd_w_ = static_cast<float>(new_value[5]);
+  chMtxUnlock(&state_mutex_);
+}
+
+void DiffDriveService::OnLoopTuningChanged(const double* new_value, uint32_t length) {
+  if (length != 6) return;
+  // [kp, ki, ks, kv, out_max, slew]. A negative (or NaN) element leaves that gain alone,
+  // so a single gain can be swept without restating the rest. Unlike a register write
+  // this takes effect on the next loop iteration and does not restart the service -
+  // that is the point: it is what the tuning harness sweeps gains with while driving.
+  chMtxLock(&state_mutex_);
+  float* targets[6] = {&tune_kp_, &tune_ki_, &tune_ks_, &tune_kv_, &tune_out_max_, &tune_slew_};
+  for (uint32_t i = 0; i < 6; i++) {
+    const double v = new_value[i];
+    // NaN compares false against itself; skip it along with the negative sentinel.
+    if (v >= 0.0) {
+      *targets[i] = static_cast<float>(v);
+    }
+  }
   chMtxUnlock(&state_mutex_);
 }

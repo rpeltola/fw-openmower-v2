@@ -36,6 +36,12 @@ class MotorDriver {
     float rpm;
 
     ESCStatus status;
+    // Why the cause is reported alongside the status rather than folded into it: status is
+    // the lifecycle (OK / ERROR / DISCONNECTED / ...) and things act on it - docking, for
+    // one, treats a stall as success. The cause is a separate question, so it gets a
+    // separate field. Drivers that cannot tell one fault from another leave this at 0
+    // (= no fault reported); 0 always means "nothing to report", never "fine".
+    uint8_t fault_code;
   };
 
   typedef etl::delegate<void(const ESCState &new_state)> StateCallback;
