@@ -117,6 +117,11 @@ class DiffDriveService : public DiffDriveServiceBase {
   // register is <= 0. Caps how fast the correction can move, so an overshoot cannot be
   // dumped in one cycle; the feedforward is not slewed.
   static constexpr float kDutyLoopSlew = 3.0f;  // duty per second
+  // Bounds on the loop's dt [s], around the nominal 0.02 (50 Hz). A late or missed ESC
+  // status must not turn into one giant integration + slew step; a suspiciously early one
+  // must not divide by ~0. Only the control loop is clamped, never the odometry.
+  static constexpr float kMinLoopDtS = 0.005f;
+  static constexpr float kMaxLoopDtS = 0.06f;
   // Tolerance band: within this speed error we command no correction, to avoid
   // hunting on the coarse low-speed hall feedback. Keep this WELL below the slowest
   // wheel speed we want to hold, or slow commands get swallowed and never drive.

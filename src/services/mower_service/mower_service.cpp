@@ -80,6 +80,9 @@ void MowerService::tick() {
     SendMowerESCTemperature(esc_state_.temperature_pcb);
     SendMowerMotorCurrent(esc_state_.current_input);
     SendMowerStatus(static_cast<uint8_t>(esc_state_.status));
+    // The cause behind an ERROR status, when the ESC can name one (VESC mc_fault_code;
+    // 0 = nothing reported). Sent beside the status, never folded into it.
+    SendMowerESCFaultCode(esc_state_.fault_code);
     SendMowerMotorTemperature(esc_state_.temperature_motor);
     SendMowerRunning(std::fabs(esc_state_.rpm) > 0);
     SendMowerMotorRPM(std::fabs(esc_state_.rpm));

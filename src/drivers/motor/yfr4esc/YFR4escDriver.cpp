@@ -74,6 +74,10 @@ void YFR4escDriver::ProcessDecodedPacket(uint8_t* packet, size_t len) {
       latest_state_.rpm = static_cast<float>(sp.rpm);
       latest_state_.status =
           sp.fault_code == 0 ? ESCState::ESCStatus::ESC_STATUS_OK : ESCState::ESCStatus::ESC_STATUS_ERROR;
+      // ESCState::fault_code deliberately stays 0 here. This ESC's fault_code is a BITFIELD
+      // (see FaultBit below), while the field on the wire carries the VESC's enumerated
+      // mc_fault_code - forwarding these bits would decode as an unrelated named fault.
+      // Reporting them needs its own encoding; until then, no claim is better than a wrong one.
 
       if (sp.fault_code & (0b1 << FaultBit::UNINITIALIZED)) {
         SendSettings();

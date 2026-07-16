@@ -270,21 +270,22 @@ void DiffDriveService::ProcessStatusUpdate() {
   SendRightESCCurrent(right_esc_state_.current_input);
   SendRightESCStatus(static_cast<uint8_t>(right_esc_state_.status));
 
-  // Forward the remaining ESC telemetry already parsed into ESCState. Direction is not
-  // sent: it is sign(rpm) (see the VESC driver, which derives it exactly that way), and
-  // the service description has to fit a single advertise datagram, so the consumer
-  // derives it from Rpm instead.
+  // Forward the remaining ESC telemetry already parsed into ESCState. Two fields are
+  // deliberately NOT sent, because the description must fit one advertise datagram and
+  // the fault cause earns their bytes: Direction (it is sign(rpm), which the consumer can
+  // derive just as the VESC driver does) and Tacho Absolute (an accumulator nothing
+  // computes with - the odometry-bearing count is Wheel Ticks, sent below).
   SendLeftESCRpm(left_esc_state_.rpm);
   SendLeftESCDutyCycle(left_esc_state_.duty_cycle);
   SendLeftESCInputVoltage(left_esc_state_.voltage_input);
   SendLeftESCMotorTemperature(left_esc_state_.temperature_motor);
-  SendLeftESCTachoAbsolute(left_esc_state_.tacho_absolute);
+  SendLeftESCFaultCode(left_esc_state_.fault_code);
 
   SendRightESCRpm(right_esc_state_.rpm);
   SendRightESCDutyCycle(right_esc_state_.duty_cycle);
   SendRightESCInputVoltage(right_esc_state_.voltage_input);
   SendRightESCMotorTemperature(right_esc_state_.temperature_motor);
-  SendRightESCTachoAbsolute(right_esc_state_.tacho_absolute);
+  SendRightESCFaultCode(right_esc_state_.fault_code);
 
   // Calculate the twist according to wheel ticks
   if (last_ticks_valid) {
@@ -330,11 +331,17 @@ void DiffDriveService::ProcessStatusUpdate() {
       const float out_max =
           tune_out_max_ > 0.0f ? tune_out_max_ : (LoopMaxOutput.value > 0.0f ? LoopMaxOutput.value : 1.0f);
       const float max_slew = tune_slew_ > 0.0f ? tune_slew_ : (LoopSlew.value > 0.0f ? LoopSlew.value : kDutyLoopSlew);
+      // Bound the loop's dt. If an ESC goes quiet for a while (UART glitch) but the twist
+      // keeps arriving, so the 1 s hard-stop never fires, the next status pair would
+      // otherwise integrate that whole gap in one step and make the PI slew limit useless
+      // for exactly the cycle that needs it - the wheel would jump on reconnect. The
+      // odometry above deliberately keeps the true dt: a real gap IS slower motion.
+      const float loop_dt = dt < kMinLoopDtS ? kMinLoopDtS : (dt > kMaxLoopDtS ? kMaxLoopDtS : dt);
       bool sat_l = false, sat_r = false, slew_l = false, slew_r = false;
-      speed_l_ = RunSpeedLoop(target_v_l_, meas_filt_l_, integ_l_, pi_prev_l_, kp, ki, ks, kv, out_max, max_slew, dt,
-                              sat_l, slew_l);
-      speed_r_ = RunSpeedLoop(target_v_r_, meas_filt_r_, integ_r_, pi_prev_r_, kp, ki, ks, kv, out_max, max_slew, dt,
-                              sat_r, slew_r);
+      speed_l_ = RunSpeedLoop(target_v_l_, meas_filt_l_, integ_l_, pi_prev_l_, kp, ki, ks, kv, out_max, max_slew,
+                              loop_dt, sat_l, slew_l);
+      speed_r_ = RunSpeedLoop(target_v_r_, meas_filt_r_, integ_r_, pi_prev_r_, kp, ki, ks, kv, out_max, max_slew,
+                              loop_dt, sat_r, slew_r);
       SendMotorCommand();
 
       // Debug frame for the tuning harness: everything needed to reconstruct one loop
