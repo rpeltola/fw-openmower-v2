@@ -87,19 +87,31 @@ etl::atomic<uint16_t> volume_{256};  // unity gain by default; SetVolume() overr
 etl::atomic<bool> playing_{false};
 
 thread_t* feeder_thread_ = nullptr;
-THD_WORKING_AREA(feeder_wa_, 768);
+THD_WORKING_AREA(feeder_wa_, 2048);
 
 constexpr eventmask_t kEvtRefillHalf0 = 1u << 0;
 constexpr eventmask_t kEvtRefillHalf1 = 1u << 1;
+
+// Guards source_ and mono_scratch_ (below) against the feeder thread's RefillHalf() running
+// concurrently with a caller's Play()/Stop(). RefillHalf() only ever runs in thread context -
+// BdmaIsr() (below) merely signals events, it never calls RefillHalf() itself - so a mutex (as
+// opposed to a critical section) is safe here.
+MUTEX_DECL(audio_mutex_);
+
+// Bounce buffer for RefillHalf()'s call into source_(): 1 KiB (kSamplesPerHalf * sizeof(int16_t))
+// is too large to carry on a caller's stack (Play() can be reached from SoundService::ThreadFunc,
+// whose whole working area is a fraction of that), so it lives here instead, serialized by
+// audio_mutex_ like source_.
+int16_t mono_scratch_[kSamplesPerHalf];
 
 inline int16_t ApplyVolume(int16_t sample) {
   return static_cast<int16_t>((static_cast<int32_t>(sample) * volume_.load()) / 256);
 }
 
 // Disables SPI6 + the BDMA stream and forgets the current source. Shared by the public Stop()
-// and by RefillHalf() (which needs the same action once a fully-silent half confirms the
-// source has drained, but can't call the public Stop() without name-clashing with itself).
-void DisableHardware() {
+// and by RefillHalfLocked() (which needs the same action once a fully-silent half confirms the
+// source has drained). Assumes audio_mutex_ is already held.
+void DisableHardwareLocked() {
   SPI6->CR1 &= ~SPI_CR1_SPE;
   if (dma_stream_ != nullptr) {
     bdmaStreamDisable(dma_stream_);
@@ -112,18 +124,17 @@ void DisableHardware() {
 // fewer than kSamplesPerHalf samples, the rest of this half is silence-padded and source_ is
 // cleared (end-of-stream latched). If source_ was already cleared on a previous call (this half
 // comes back fully silent) and we are actually playing, one whole buffer's worth of trailing
-// silence has now been queued - safe to mute.
-void RefillHalf(size_t half) {
-  int16_t mono[kSamplesPerHalf];
+// silence has now been queued - safe to mute. Assumes audio_mutex_ is already held.
+void RefillHalfLocked(size_t half) {
   size_t n = 0;
   const bool was_active = (source_ != nullptr);
   if (was_active) {
-    n = source_(mono, kSamplesPerHalf);
+    n = source_(mono_scratch_, kSamplesPerHalf);
   }
 
   int16_t* half_base = dma_buffer_ + half * kWordsPerHalf;
   for (size_t i = 0; i < kSamplesPerHalf; i++) {
-    const int16_t sample = (i < n) ? ApplyVolume(mono[i]) : 0;
+    const int16_t sample = (i < n) ? ApplyVolume(mono_scratch_[i]) : 0;
     half_base[2 * i] = sample;      // Left
     half_base[2 * i + 1] = sample;  // Right (MAX98357A's hardwired SD_MODE strap decides
                                     // whether it plays L, R or their average; L==R makes the
@@ -133,8 +144,16 @@ void RefillHalf(size_t half) {
   if (was_active && n < kSamplesPerHalf) {
     source_ = nullptr;  // end-of-stream: stop pulling further data
   } else if (!was_active && playing_.load()) {
-    DisableHardware();
+    DisableHardwareLocked();
   }
+}
+
+// Feeder-thread entry point: acquires audio_mutex_ before touching source_/mono_scratch_/the DMA
+// state, so it can never interleave with a Play()/Stop() in progress on another thread.
+void RefillHalf(size_t half) {
+  chMtxLock(&audio_mutex_);
+  RefillHalfLocked(half);
+  chMtxUnlock(&audio_mutex_);
 }
 
 // BDMA1 stream ISR: only ever signals the feeder thread, never touches lfs/hardware itself.
@@ -219,19 +238,25 @@ void Play(SampleSource source) {
     return;
   }
 
+  // Held for the whole transition below (stop old source -> arm new one) so the feeder thread's
+  // RefillHalf() can never run against a half-updated source_/DMA state - it either sees the old
+  // source through to DisableHardwareLocked(), or the fully-armed new one, never a mix.
+  chMtxLock(&audio_mutex_);
+
   // Stop any stream already in progress first - also leaves SPI6/BDMA in a known-disabled state
   // while we re-prime the buffer below.
-  Stop();
+  DisableHardwareLocked();
 
   source_ = source;
   // Pre-fill both halves synchronously, on the calling thread (not the feeder thread/ISR), so
   // the very first BDMA pass transmits real audio instead of stale/garbage buffer contents. If
-  // the source is very short (drains within these two calls), RefillHalf() already silence-pads
-  // the tail and clears source_; it won't call Stop() itself here since playing_ is still false
-  // at this point (only set below), so the hardware still gets armed normally below and the
-  // already-primed silence-padded buffer plays out before the feeder thread mutes it.
-  RefillHalf(0);
-  RefillHalf(1);
+  // the source is very short (drains within these two calls), RefillHalfLocked() already
+  // silence-pads the tail and clears source_; it won't call DisableHardwareLocked() itself here
+  // since playing_ is still false at this point (only set below), so the hardware still gets
+  // armed normally below and the already-primed silence-padded buffer plays out before the
+  // feeder thread mutes it.
+  RefillHalfLocked(0);
+  RefillHalfLocked(1);
 
   bdmaStreamSetMemory0(dma_stream_, dma_buffer_);
   bdmaStreamSetTransactionSize(dma_stream_, kTotalWords);
@@ -246,10 +271,20 @@ void Play(SampleSource source) {
   // it starts BCLK/WS generation.
   SPI6->CR1 |= SPI_CR1_SPE;
   playing_.store(true);
+
+  chMtxUnlock(&audio_mutex_);
 }
 
+// Returns once no refill is in flight and source_ is cleared, so a caller can safely tear down
+// whatever that source was reading from. Guarded like Play(): without a successful Init() the
+// SPI6 kernel clock is off and touching CR1 would fault.
 void Stop() {
-  DisableHardware();
+  if (dma_stream_ == nullptr) {
+    return;
+  }
+  chMtxLock(&audio_mutex_);
+  DisableHardwareLocked();
+  chMtxUnlock(&audio_mutex_);
 }
 
 bool IsPlaying() {
