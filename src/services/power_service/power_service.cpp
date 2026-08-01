@@ -6,6 +6,7 @@
 
 #include <ulog.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <globals.hpp>
@@ -138,10 +139,41 @@ void PowerService::update_esc_power_() {
 void PowerService::driver_tick_() {
   update_charger_();
   read_adc_();
+  check_adapter_chime_();
 
   if (charger_configured_ && power_management_callback_) {
     power_management_callback_();
   }
+}
+
+void PowerService::check_adapter_chime_() {
+  // Prefer the charger's own adapter-voltage reading; fall back to the ADC rail on boards
+  // where the charger doesn't report one.
+  constexpr float kAdapterPresentVolts = 15.0f;
+  constexpr uint8_t kAdapterDebounceTicks = 2;  // driver schedule is 1 Hz -> ~2 s debounce
+
+  float volts = adapter_volts_;
+  if (volts <= 0.0f || std::isnan(volts)) volts = adapter_volts_adc_;
+  if (std::isnan(volts)) return;
+
+  const bool present = volts > kAdapterPresentVolts;
+  if (!adapter_present_known_) {
+    // The first valid sample only establishes the baseline: booting while docked must not chime.
+    adapter_present_ = present;
+    adapter_present_known_ = true;
+    return;
+  }
+
+  if (present == adapter_present_) {
+    adapter_edge_count_ = 0;
+    return;
+  }
+  if (++adapter_edge_count_ < kAdapterDebounceTicks) {
+    return;
+  }
+  adapter_present_ = present;
+  adapter_edge_count_ = 0;
+  audio_service.RequestTone(present ? TonePattern::CHARGE_CONNECT : TonePattern::CHARGE_DISCONNECT, AudioClass::UI);
 }
 
 void PowerService::read_adc_() {

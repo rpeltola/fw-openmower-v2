@@ -90,7 +90,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         src/services/input_service/input_service.cpp
         src/services/high_level_service/high_level_service.cpp
         src/services/filesystem_service/filesystem_service.cpp
-        src/services/sound_service/sound_service.cpp
+        src/services/audio_service/audio_service.cpp
+        src/services/audio_service/tone_source.cpp
         # I2S6 audio driver (SPI6/I2S6 -> MAX98357A)
         src/drivers/audio/i2s6_audio.cpp
         # BQ2567 driver
@@ -175,6 +176,7 @@ target_add_service(${CMAKE_PROJECT_NAME} GpsService ${CMAKE_CURRENT_SOURCE_DIR}/
 target_add_service(${CMAKE_PROJECT_NAME} InputService ${CMAKE_CURRENT_SOURCE_DIR}/services/input_service.json)
 target_add_service(${CMAKE_PROJECT_NAME} HighLevelService ${CMAKE_CURRENT_SOURCE_DIR}/services/high_level_service.json)
 target_add_service(${CMAKE_PROJECT_NAME} FilesystemService ${CMAKE_CURRENT_SOURCE_DIR}/services/filesystem_service.json)
+target_add_service(${CMAKE_PROJECT_NAME} AudioService ${CMAKE_CURRENT_SOURCE_DIR}/services/audio_service.json)
 
 set_target_properties(${CMAKE_PROJECT_NAME}
         PROPERTIES SUFFIX ".elf")
