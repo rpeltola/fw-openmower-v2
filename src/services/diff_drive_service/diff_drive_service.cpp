@@ -172,7 +172,7 @@ void DiffDriveService::tick() {
   right_esc_driver_->RequestStatus();
 
   // Check, if we have received ESC status updates recently. If not, send a disconnected message
-  if (xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > kEscTelemetryTimeoutUs) {
+  if (esc_telemetry_stale) {
     const auto no_data_status = power_service.EscPowerIsOff()
                                     ? MotorDriver::ESCState::ESCStatus::ESC_STATUS_POWERED_OFF
                                     : MotorDriver::ESCState::ESCStatus::ESC_STATUS_DISCONNECTED;
