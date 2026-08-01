@@ -114,6 +114,20 @@ size_t FeedFromFile(int16_t* dst, size_t n_samples) {
   return samples_read;
 }
 
+// Releases the handle a preempted track was streaming from. FeedFromFile() closes the file
+// itself at end-of-stream, but a track cut short by something else taking over the voice never
+// gets there - and once i2s6_audio's source_ points somewhere else it is never re-entered, so
+// the handle would stay open indefinitely. Must be called with the stream already retired
+// (audio::Stop()), so no FeedFromFile() can be in flight, and with playback_mutex_ NOT held.
+void CloseStream() {
+  chMtxLock(&playback_mutex_);
+  if (playback_file_.isOpen()) {
+    playback_file_.close();
+  }
+  remaining_samples_ = 0;
+  chMtxUnlock(&playback_mutex_);
+}
+
 // ---- Named-sound tables ----
 
 // Legacy V1 numbered tracks: named sound -> /user/audio/<n>.wav fallback. Keeps every WAV
@@ -154,12 +168,14 @@ constexpr uint16_t kSafetyVolumeFloor = 205;
 constexpr uint32_t kStartupGraceMs = 10'000;  // see CheckEmergencyEdges()
 constexpr uint32_t kBootChimeDelayMs = 1'500;
 
-bool BuildToneProgram(TonePattern pattern, uint16_t freq, uint16_t duration_ms, uint8_t count) {
-  using tone::Segment;
-  Segment segs[tone::kMaxSegments];
-  size_t n = 0;
-  uint8_t repeats = 1;
-  int16_t amplitude = kToneAmplitude;
+// Pure builder: fills the caller's program without touching the tone generator, so callers can
+// validate a request BEFORE retiring whatever is currently playing - an invalid request must
+// never cost the running sound its voice.
+bool BuildToneProgram(TonePattern pattern, uint16_t freq, uint16_t duration_ms, uint8_t count, tone::Segment* segs,
+                      size_t& n, uint8_t& repeats, int16_t& amplitude) {
+  n = 0;
+  repeats = 1;
+  amplitude = kToneAmplitude;
 
   switch (pattern) {
     case TonePattern::ACK: segs[n++] = {880, 880, 60}; break;
@@ -208,7 +224,6 @@ bool BuildToneProgram(TonePattern pattern, uint16_t freq, uint16_t duration_ms, 
     default: return false;
   }
 
-  tone::SetToneProgram(segs, n, repeats, amplitude);
   return true;
 }
 
@@ -228,6 +243,105 @@ bool ValidName(const char* name, size_t len) {
 bool FileExists(const char* path) {
   struct lfs_info info;
   return lfs_stat(&lfs, path, &info) == LFS_ERR_OK && info.type == LFS_TYPE_REG;
+}
+
+/**
+ * @brief Parse and validate f's RIFF/WAVE header; returns the data-chunk size in bytes (0 = bad).
+ *
+ * On success the file position is at the first PCM sample. Walks chunks until "fmt " and "data"
+ * are both found (order in the file is not assumed beyond "fmt " coming before "data", which is
+ * required to validate before streaming). Bounded three ways so a malformed file is rejected
+ * instead of hanging the service thread (which also drives emergency sounds) forever: a chunk
+ * claiming to be bigger than the whole file is rejected outright, every seek() return value is
+ * checked, and the file position is required to strictly advance every pass - a seek that
+ * silently failed to move it would otherwise re-read the same chunk header forever.
+ */
+uint32_t ParseWavHeader(File& f, const char* path) {
+  WavRiffHeader riff{};
+  if (f.read(&riff, sizeof(riff)) != static_cast<int>(sizeof(riff)) || memcmp(riff.riff_id, "RIFF", 4) != 0 ||
+      memcmp(riff.wave_id, "WAVE", 4) != 0) {
+    ULOG_WARNING("AudioService: %s is not a RIFF/WAVE file", path);
+    return 0;
+  }
+
+  const int file_size = f.size();
+  bool have_fmt = false;
+  WavFmtChunk fmt{};
+  uint32_t data_size = 0;
+  constexpr int kMaxChunks = 32;  // real WAV files have a handful of chunks; this is a hang guard
+  lfs_soff_t pos = f.seek(0, LFS_SEEK_CUR);
+  for (int i = 0; file_size >= 0 && pos >= 0 && i < kMaxChunks; i++) {
+    WavChunkHeader chunk{};
+    if (f.read(&chunk, sizeof(chunk)) != static_cast<int>(sizeof(chunk))) {
+      break;  // EOF before a "data" chunk was found
+    }
+    if (chunk.size > static_cast<uint32_t>(file_size)) {
+      ULOG_WARNING("AudioService: %s has an implausible chunk size %lu", path, static_cast<unsigned long>(chunk.size));
+      break;
+    }
+
+    bool seek_ok = true;
+    if (memcmp(chunk.id, "fmt ", 4) == 0) {
+      const size_t to_read = etl::min(chunk.size, static_cast<uint32_t>(sizeof(fmt)));
+      if (f.read(&fmt, to_read) != static_cast<int>(to_read)) break;
+      have_fmt = true;
+      if (chunk.size > to_read) {
+        seek_ok = f.seek(static_cast<lfs_soff_t>(chunk.size - to_read), LFS_SEEK_CUR) >= 0;
+      }
+      if (seek_ok && (chunk.size & 1)) {  // RIFF chunks are word-aligned
+        seek_ok = f.seek(1, LFS_SEEK_CUR) >= 0;
+      }
+    } else if (memcmp(chunk.id, "data", 4) == 0) {
+      data_size = chunk.size;  // file position is now at the first PCM sample
+      break;
+    } else {
+      seek_ok = f.seek(static_cast<lfs_soff_t>(chunk.size + (chunk.size & 1)), LFS_SEEK_CUR) >= 0;
+    }
+    if (!seek_ok) {
+      ULOG_WARNING("AudioService: %s seek failed while walking chunks", path);
+      break;
+    }
+
+    const lfs_soff_t new_pos = f.seek(0, LFS_SEEK_CUR);
+    if (new_pos <= pos) {
+      ULOG_WARNING("AudioService: %s chunk walk stalled (position did not advance)", path);
+      break;
+    }
+    pos = new_pos;
+  }
+
+  if (!have_fmt || data_size == 0) {
+    ULOG_WARNING("AudioService: %s has no fmt/data chunk", path);
+    return 0;
+  }
+  if (fmt.audio_format != kWavFormatPcm || fmt.num_channels != kWavChannelsMono ||
+      fmt.bits_per_sample != kWavBitsPerSample || fmt.sample_rate != xbot::driver::audio::kSampleRateHz) {
+    ULOG_WARNING(
+        "AudioService: %s format mismatch (fmt=%u ch=%u bits=%u rate=%lu), expected PCM/mono/16-bit/%lu Hz - not "
+        "playing it",
+        path, fmt.audio_format, fmt.num_channels, fmt.bits_per_sample, static_cast<unsigned long>(fmt.sample_rate),
+        static_cast<unsigned long>(xbot::driver::audio::kSampleRateHz));
+    return 0;
+  }
+  return data_size;
+}
+
+/**
+ * @brief Pre-flight check on its own scratch handle: is path a playable WAV?
+ *
+ * Runs before the current sound is retired, so a missing/corrupt/wrong-format file can be
+ * rejected (or skipped over in the resolution chain) without silencing whatever is playing.
+ * Uses a local File, so it is safe while the feeder thread streams from playback_file_.
+ */
+bool ValidateWav(const char* path) {
+  File f;
+  if (f.open(path, LFS_O_RDONLY) != LFS_ERR_OK) {
+    ULOG_WARNING("AudioService: cannot open %s", path);
+    return false;
+  }
+  const uint32_t data_size = ParseWavHeader(f, path);
+  f.close();
+  return data_size != 0;
 }
 
 }  // namespace
@@ -250,9 +364,17 @@ bool AudioService::OnStart() {
     ULOG_ERROR("AudioService: I2S6Audio::Init() failed, sound disabled");
   }
 
-  start_micros_ = xbot::service::system::getTimeMicros();
-  boot_chime_played_ = false;
-  last_reasons_ = 0;
+  // OnStart() re-runs on every xbot CLAIM (this service has no registers, so the framework
+  // restarts it whenever ROS reconnects), but the boot chime, the emergency startup grace,
+  // and the last-seen reason mask are per-POWER-ON state: re-arming them on a claim would
+  // chime twice per boot and swallow the ros_ok falling edge behind a fresh 10 s grace.
+  if (!ever_started_) {
+    ever_started_ = true;
+    start_micros_ = xbot::service::system::getTimeMicros();
+    boot_chime_played_ = false;
+    grace_elapsed_ = false;
+    last_reasons_ = 0;
+  }
   return true;
 }
 
@@ -274,7 +396,13 @@ uint32_t AudioService::OnLoop(uint32_t now_micros, uint32_t) {
     StartNamed("boot", 4, AudioClass::UI);
   }
 
-  if (elapsed_ms >= kStartupGraceMs) {
+  // Latched, not re-evaluated: getTimeMicros() is a 32-bit microsecond counter, so elapsed_ms
+  // wraps back to 0 every ~71.6 min. Re-testing the threshold every loop would re-arm the grace
+  // period at every wrap and silently drop 10 s of emergency edges, indefinitely.
+  if (!grace_elapsed_ && elapsed_ms >= kStartupGraceMs) {
+    grace_elapsed_ = true;
+  }
+  if (grace_elapsed_) {
     CheckEmergencyEdges();
   }
 
@@ -381,14 +509,18 @@ uint8_t AudioService::StartNamed(const char* name, size_t name_len, AudioClass a
     return Res(AudioResult::ERR_DROPPED);
   }
 
+  // Each candidate is fully validated (open + header parse on a scratch handle) BEFORE the
+  // current sound is retired, and a bad file just drops through to the next fallback - a
+  // corrupt custom override degrades to the numbered track / built-in default instead of
+  // killing the running sound and going silent.
   char path[96];
   snprintf(path, sizeof(path), "/user/audio/%.*s.wav", static_cast<int>(name_len), name);
-  if (!FileExists(path)) {
+  if (!FileExists(path) || !ValidateWav(path)) {
     path[0] = '\0';
     for (const auto& alias : kTrackAliases) {
       if (strlen(alias.name) == name_len && memcmp(alias.name, name, name_len) == 0) {
         snprintf(path, sizeof(path), "/user/audio/%u.wav", alias.track);
-        if (!FileExists(path)) path[0] = '\0';
+        if (!FileExists(path) || !ValidateWav(path)) path[0] = '\0';
         break;
       }
     }
@@ -397,7 +529,7 @@ uint8_t AudioService::StartNamed(const char* name, size_t name_len, AudioClass a
   if (path[0] != '\0') {
     ApplyClassVolume(audio_class);
     if (!PlayPath(path)) {
-      return Res(AudioResult::ERR_NOENT);
+      return Res(AudioResult::ERR_NOENT);  // validated a moment ago; only a delete race gets here
     }
     playing_class_ = U8(audio_class);
     SendPlayingClass(playing_class_);
@@ -420,6 +552,13 @@ uint8_t AudioService::StartTone(TonePattern pattern, AudioClass audio_class, uin
   if (!driver_ok_) {
     return Res(AudioResult::ERR_INVAL);
   }
+  tone::Segment segs[tone::kMaxSegments];
+  size_t n = 0;
+  uint8_t repeats = 1;
+  int16_t amplitude = kToneAmplitude;
+  if (!BuildToneProgram(pattern, freq, duration_ms, count, segs, n, repeats, amplitude)) {
+    return Res(AudioResult::ERR_INVAL);
+  }
   if (!ArbitrateStart(audio_class)) {
     return Res(AudioResult::ERR_DROPPED);
   }
@@ -427,9 +566,8 @@ uint8_t AudioService::StartTone(TonePattern pattern, AudioClass audio_class, uin
   // Retire any running stream before loading the program: FeedTone() must never render a
   // half-swapped program, and Play() below re-primes the DMA buffers from scratch.
   xbot::driver::audio::Stop();
-  if (!BuildToneProgram(pattern, freq, duration_ms, count)) {
-    return Res(AudioResult::ERR_INVAL);
-  }
+  CloseStream();  // a WAV we just preempted would otherwise keep its lfs handle open forever
+  tone::SetToneProgram(segs, n, repeats, amplitude);
   ApplyClassVolume(audio_class);
   xbot::driver::audio::Play(&tone::FeedTone);
   playing_class_ = U8(audio_class);
@@ -463,81 +601,8 @@ bool AudioService::PlayPath(const char* path) {
     return false;
   }
 
-  WavRiffHeader riff{};
-  if (playback_file_.read(&riff, sizeof(riff)) != static_cast<int>(sizeof(riff)) ||
-      memcmp(riff.riff_id, "RIFF", 4) != 0 || memcmp(riff.wave_id, "WAVE", 4) != 0) {
-    ULOG_WARNING("AudioService: %s is not a RIFF/WAVE file", path);
-    playback_file_.close();
-    chMtxUnlock(&playback_mutex_);
-    return false;
-  }
-
-  // Walk chunks until "fmt " and "data" are both found (order in the file is not assumed beyond
-  // "fmt " coming before "data", which is required to validate before streaming). Bounded three
-  // ways so a malformed file is rejected instead of hanging the service thread (which also
-  // drives emergency sounds) forever: a chunk claiming to be bigger than the whole file is
-  // rejected outright, every seek() return value is checked, and the file position is required
-  // to strictly advance every pass - a seek that silently failed to move it would otherwise
-  // re-read the same chunk header forever.
-  const int file_size = playback_file_.size();
-  bool have_fmt = false;
-  WavFmtChunk fmt{};
-  uint32_t data_size = 0;
-  constexpr int kMaxChunks = 32;  // real WAV files have a handful of chunks; this is a hang guard
-  lfs_soff_t pos = playback_file_.seek(0, LFS_SEEK_CUR);
-  for (int i = 0; file_size >= 0 && pos >= 0 && i < kMaxChunks; i++) {
-    WavChunkHeader chunk{};
-    if (playback_file_.read(&chunk, sizeof(chunk)) != static_cast<int>(sizeof(chunk))) {
-      break;  // EOF before a "data" chunk was found
-    }
-    if (chunk.size > static_cast<uint32_t>(file_size)) {
-      ULOG_WARNING("AudioService: %s has an implausible chunk size %lu", path, static_cast<unsigned long>(chunk.size));
-      break;
-    }
-
-    bool seek_ok = true;
-    if (memcmp(chunk.id, "fmt ", 4) == 0) {
-      const size_t to_read = etl::min(chunk.size, static_cast<uint32_t>(sizeof(fmt)));
-      if (playback_file_.read(&fmt, to_read) != static_cast<int>(to_read)) break;
-      have_fmt = true;
-      if (chunk.size > to_read) {
-        seek_ok = playback_file_.seek(static_cast<lfs_soff_t>(chunk.size - to_read), LFS_SEEK_CUR) >= 0;
-      }
-      if (seek_ok && (chunk.size & 1)) {  // RIFF chunks are word-aligned
-        seek_ok = playback_file_.seek(1, LFS_SEEK_CUR) >= 0;
-      }
-    } else if (memcmp(chunk.id, "data", 4) == 0) {
-      data_size = chunk.size;  // file position is now at the first PCM sample
-      break;
-    } else {
-      seek_ok = playback_file_.seek(static_cast<lfs_soff_t>(chunk.size + (chunk.size & 1)), LFS_SEEK_CUR) >= 0;
-    }
-    if (!seek_ok) {
-      ULOG_WARNING("AudioService: %s seek failed while walking chunks", path);
-      break;
-    }
-
-    const lfs_soff_t new_pos = playback_file_.seek(0, LFS_SEEK_CUR);
-    if (new_pos <= pos) {
-      ULOG_WARNING("AudioService: %s chunk walk stalled (position did not advance)", path);
-      break;
-    }
-    pos = new_pos;
-  }
-
-  if (!have_fmt || data_size == 0) {
-    ULOG_WARNING("AudioService: %s has no fmt/data chunk", path);
-    playback_file_.close();
-    chMtxUnlock(&playback_mutex_);
-    return false;
-  }
-  if (fmt.audio_format != kWavFormatPcm || fmt.num_channels != kWavChannelsMono ||
-      fmt.bits_per_sample != kWavBitsPerSample || fmt.sample_rate != xbot::driver::audio::kSampleRateHz) {
-    ULOG_WARNING(
-        "AudioService: %s format mismatch (fmt=%u ch=%u bits=%u rate=%lu), expected PCM/mono/16-bit/%lu Hz - not "
-        "playing it",
-        path, fmt.audio_format, fmt.num_channels, fmt.bits_per_sample, static_cast<unsigned long>(fmt.sample_rate),
-        static_cast<unsigned long>(xbot::driver::audio::kSampleRateHz));
+  const uint32_t data_size = ParseWavHeader(playback_file_, path);
+  if (data_size == 0) {
     playback_file_.close();
     chMtxUnlock(&playback_mutex_);
     return false;

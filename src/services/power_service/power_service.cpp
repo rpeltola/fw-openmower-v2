@@ -148,12 +148,15 @@ void PowerService::driver_tick_() {
 
 void PowerService::check_adapter_chime_() {
   // Prefer the charger's own adapter-voltage reading; fall back to the ADC rail on boards
-  // where the charger doesn't report one.
+  // where the charger doesn't report one. Validity is "is the source alive", NOT the value:
+  // 0.0 V is the normal, legitimate undocked reading (and the ADC rail is only registered on
+  // Sabo), so gating on the value would leave the baseline unknown forever off-dock and kill
+  // the chime on every other board.
   constexpr float kAdapterPresentVolts = 15.0f;
   constexpr uint8_t kAdapterDebounceTicks = 2;  // driver schedule is 1 Hz -> ~2 s debounce
 
-  float volts = adapter_volts_;
-  if (volts <= 0.0f || std::isnan(volts)) volts = adapter_volts_adc_;
+  float volts = charger_configured_.load() ? adapter_volts_ : std::numeric_limits<float>::quiet_NaN();
+  if (std::isnan(volts)) volts = adapter_volts_adc_;
   if (std::isnan(volts)) return;
 
   const bool present = volts > kAdapterPresentVolts;

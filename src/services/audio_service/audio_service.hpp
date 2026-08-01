@@ -96,7 +96,9 @@ class AudioService : public AudioServiceBase {
   etl::atomic<bool> quiet_mode_{false};
 
   bool driver_ok_ = false;
+  bool ever_started_ = false;  ///< distinguishes power-on from a re-claim restart (see OnStart())
   bool boot_chime_played_ = false;
+  bool grace_elapsed_ = false;  ///< latched once the startup grace expired (see OnLoop())
   uint32_t start_micros_ = 0;
   uint16_t last_reasons_ = 0;
 

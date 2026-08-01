@@ -455,8 +455,17 @@ void YFCoverUI::HandleButton(const msg_event_button* msg) {
 
   // Immediate press feedback, independent of whether ROS has configured this button: the beep
   // must not depend on a round trip (or on ROS being up at all). Runs on the comms thread, so
-  // it goes through the AudioService mailbox rather than starting playback here.
-  audio_service.RequestTone(TonePattern::ACK, AudioClass::UI);
+  // it goes through the AudioService mailbox rather than starting playback here. Rate-limited
+  // because the panel may emit an event per duration threshold (single/long/very long) for one
+  // physical press - without the guard a held button would stutter-restart the ACK chirp.
+  static systime_t last_beep_time = 0;
+  static bool beeped_once = false;
+  const systime_t now = chVTGetSystemTimeX();
+  if (!beeped_once || chTimeDiffX(last_beep_time, now) > TIME_MS2I(400)) {
+    beeped_once = true;
+    last_beep_time = now;
+    audio_service.RequestTone(TonePattern::ACK, AudioClass::UI);
+  }
 
   // Inject press into any registered Input configured as a button with matching button_id.
   // Button inputs are identified by bit 7 of channel being set (BUTTON_FLAG).
