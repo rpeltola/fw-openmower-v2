@@ -117,6 +117,7 @@ class PowerService : public PowerServiceBase {
   void update_charger_();
   void read_adc_();
   void update_esc_power_();
+  void check_adapter_chime_();
 
   ServiceSchedule tick_schedule_{*this, 1'000'000,
                                  XBOT_FUNCTION_FOR_METHOD(PowerService, &PowerService::service_tick_, this)};
@@ -138,6 +139,13 @@ class PowerService : public PowerServiceBase {
   float dcdc_current_ = std::numeric_limits<float>::quiet_NaN();
 
   int critical_count_ = 0;
+
+  // Dock-power presence edge detection for the connect/disconnect chime. Only touched on the
+  // driver schedule (the same context that writes the voltages it reads).
+  bool adapter_present_ = false;
+  bool adapter_present_known_ = false;
+  uint8_t adapter_edge_count_ = 0;
+
   CHARGER_STATUS charger_status_ = CHARGER_STATUS::COMMS_ERROR;
   ChargerDriver* charger_ = nullptr;
 
