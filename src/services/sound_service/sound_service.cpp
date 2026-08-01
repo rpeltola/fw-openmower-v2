@@ -59,9 +59,10 @@ size_t remaining_samples_ = 0;
 // Guards playback_file_ and remaining_samples_ against PlayTrack() (a re-trigger, called on
 // whichever thread owns the SoundService) closing/reopening the handle while the I2S6 driver's
 // feeder thread is mid-FeedFromFile() on it - concurrent use of one lfs_file_t is undefined
-// behaviour in littlefs. Always taken after (never before) i2s6_audio's own audio_mutex_ - only
-// FeedFromFile(), reached through RefillHalf(), ever nests the two - so the two mutexes can never
-// deadlock against each other.
+// behaviour in littlefs. The invariant to preserve is one-directional: NEVER acquire i2s6_audio's
+// audio_mutex_ while holding this one. FeedFromFile(), reached through RefillHalf(), is the only
+// place the two nest, and it nests them in that order - so wrapping any of the calls below in
+// audio_mutex_ would close the cycle and deadlock.
 MUTEX_DECL(playback_mutex_);
 
 /**
@@ -134,6 +135,17 @@ void SoundService::Start() {
 void SoundService::PlayTrack(uint8_t n) {
   char path[32];
   snprintf(path, sizeof(path), "/user/audio/%u.wav", n);
+
+  // Retire any stream still running before touching the handle it is reading from. Both tracks
+  // share one source_ (&FeedFromFile), so without this the feeder could be parked on
+  // playback_mutex_ mid-refill and resume against the NEW file the moment this function unlocks
+  // - splicing the new track's opening samples onto the old track's tail, and, for a track
+  // shorter than one DMA half (most event sounds are), draining it entirely so the prefill below
+  // finds nothing and the sound is never heard. Stop() blocks until any in-flight refill
+  // finishes and clears source_, so no FeedFromFile() can be entered after it returns. It takes
+  // only audio_mutex_ and is called with playback_mutex_ NOT held, which keeps the lock order
+  // one-directional.
+  xbot::driver::audio::Stop();
 
   // Held from the close of a possibly still-playing previous handle through to the point
   // remaining_samples_ is committed, so FeedFromFile() (feeder thread) can never observe the

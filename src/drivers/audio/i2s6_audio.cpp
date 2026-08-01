@@ -275,7 +275,13 @@ void Play(SampleSource source) {
   chMtxUnlock(&audio_mutex_);
 }
 
+// Returns once no refill is in flight and source_ is cleared, so a caller can safely tear down
+// whatever that source was reading from. Guarded like Play(): without a successful Init() the
+// SPI6 kernel clock is off and touching CR1 would fault.
 void Stop() {
+  if (dma_stream_ == nullptr) {
+    return;
+  }
   chMtxLock(&audio_mutex_);
   DisableHardwareLocked();
   chMtxUnlock(&audio_mutex_);
