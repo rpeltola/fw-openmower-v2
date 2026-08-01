@@ -139,6 +139,29 @@ void DiffDriveService::tick() {
     UpdateOpenLoopCommand();
   }
 
+  const bool esc_telemetry_stale =
+      xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > kEscTelemetryTimeoutUs;
+
+  if (esc_telemetry_stale) {
+    // Make the next status pair open a fresh odometry window rather than differencing against
+    // the pre-gap count. An ESC that rebooted during the gap (power_service cycles ESC power)
+    // restarts its tacho at 0, so that difference would publish a large bogus velocity. This is
+    // not mode-specific - the odometry is computed the same way in both control modes.
+    last_ticks_valid = false;
+  }
+
+  // duty_loop's command comes from the PI in ProcessStatusUpdate(), which only runs on ESC
+  // telemetry. If telemetry stops while Control Twist keeps arriving (e.g. a receive-only UART
+  // failure), the command timeout above never fires, so without this the last PI output would be
+  // re-sent forever. Reset the whole chain rather than just the actuator half: leaving the
+  // limiter history and per-wheel targets at the pre-stall speed would let the feedforward step
+  // straight back to that duty against a now-stationary machine when telemetry returns. Going
+  // through ResetControlState() is what the command timeout above does, so both stops resume by
+  // ramping the setpoint from standstill.
+  if (esc_telemetry_stale && ControlMode.value == kControlModeDutyLoop) {
+    ResetControlState();
+  }
+
   // Stop commanding while power_service is intentionally idling the ESCs, so the
   // xESC command-timeout releases the motor and the gate driver can sleep.
   if (!command_sent_ && !power_service.EscPowerIsOff()) {
@@ -149,7 +172,7 @@ void DiffDriveService::tick() {
   right_esc_driver_->RequestStatus();
 
   // Check, if we have received ESC status updates recently. If not, send a disconnected message
-  if (xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > 1'000'000) {
+  if (esc_telemetry_stale) {
     const auto no_data_status = power_service.EscPowerIsOff()
                                     ? MotorDriver::ESCState::ESCStatus::ESC_STATUS_POWERED_OFF
                                     : MotorDriver::ESCState::ESCStatus::ESC_STATUS_DISCONNECTED;
