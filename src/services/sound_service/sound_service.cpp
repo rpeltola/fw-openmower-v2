@@ -56,6 +56,14 @@ constexpr uint16_t kWavBitsPerSample = 16;
 File playback_file_;
 size_t remaining_samples_ = 0;
 
+// Guards playback_file_ and remaining_samples_ against PlayTrack() (a re-trigger, called on
+// whichever thread owns the SoundService) closing/reopening the handle while the I2S6 driver's
+// feeder thread is mid-FeedFromFile() on it - concurrent use of one lfs_file_t is undefined
+// behaviour in littlefs. Always taken after (never before) i2s6_audio's own audio_mutex_ - only
+// FeedFromFile(), reached through RefillHalf(), ever nests the two - so the two mutexes can never
+// deadlock against each other.
+MUTEX_DECL(playback_mutex_);
+
 /**
  * @brief xbot::driver::audio::SampleSource callback: streams PCM samples out of playback_file_.
  *
@@ -64,8 +72,11 @@ size_t remaining_samples_ = 0;
  * exhausted, which is how the driver detects end-of-stream.
  */
 size_t FeedFromFile(int16_t* dst, size_t n_samples) {
+  chMtxLock(&playback_mutex_);
+
   if (!playback_file_.isOpen() || remaining_samples_ == 0) {
     if (playback_file_.isOpen()) playback_file_.close();
+    chMtxUnlock(&playback_mutex_);
     return 0;
   }
 
@@ -75,6 +86,7 @@ size_t FeedFromFile(int16_t* dst, size_t n_samples) {
     ULOG_WARNING("SoundService: read error mid-track (result %d)", n);
     playback_file_.close();
     remaining_samples_ = 0;
+    chMtxUnlock(&playback_mutex_);
     return 0;
   }
 
@@ -83,6 +95,7 @@ size_t FeedFromFile(int16_t* dst, size_t n_samples) {
   if (remaining_samples_ == 0) {
     playback_file_.close();
   }
+  chMtxUnlock(&playback_mutex_);
   return samples_read;
 }
 
@@ -122,10 +135,16 @@ void SoundService::PlayTrack(uint8_t n) {
   char path[32];
   snprintf(path, sizeof(path), "/user/audio/%u.wav", n);
 
+  // Held from the close of a possibly still-playing previous handle through to the point
+  // remaining_samples_ is committed, so FeedFromFile() (feeder thread) can never observe the
+  // handle mid-reopen.
+  chMtxLock(&playback_mutex_);
+
   if (playback_file_.isOpen()) {
     playback_file_.close();  // guard against re-entrant calls (e.g. a very fast re-pickup)
   }
   if (playback_file_.open(path, LFS_O_RDONLY) != LFS_ERR_OK) {
+    chMtxUnlock(&playback_mutex_);
     ULOG_WARNING("SoundService: cannot open %s", path);
     return;
   }
@@ -135,36 +154,67 @@ void SoundService::PlayTrack(uint8_t n) {
       memcmp(riff.riff_id, "RIFF", 4) != 0 || memcmp(riff.wave_id, "WAVE", 4) != 0) {
     ULOG_WARNING("SoundService: %s is not a RIFF/WAVE file", path);
     playback_file_.close();
+    chMtxUnlock(&playback_mutex_);
     return;
   }
 
   // Walk chunks until "fmt " and "data" are both found (order in the file is not assumed beyond
-  // "fmt " coming before "data", which is required to validate before streaming).
+  // "fmt " coming before "data", which is required to validate before streaming). Bounded three
+  // ways so a malformed file is rejected instead of hanging the sound thread (which also drives
+  // emergency sounds) forever: a chunk claiming to be bigger than the whole file is rejected
+  // outright, every seek() return value is checked, and the file position is required to
+  // strictly advance every pass - a seek that silently failed to move it would otherwise re-read
+  // the same chunk header forever.
+  const int file_size = playback_file_.size();
   bool have_fmt = false;
   WavFmtChunk fmt{};
   uint32_t data_size = 0;
-  while (true) {
+  constexpr int kMaxChunks = 32;  // real WAV files have a handful of chunks; this is a hang guard
+  lfs_soff_t pos = playback_file_.seek(0, LFS_SEEK_CUR);
+  for (int i = 0; file_size >= 0 && pos >= 0 && i < kMaxChunks; i++) {
     WavChunkHeader chunk{};
     if (playback_file_.read(&chunk, sizeof(chunk)) != static_cast<int>(sizeof(chunk))) {
       break;  // EOF before a "data" chunk was found
     }
+    if (chunk.size > static_cast<uint32_t>(file_size)) {
+      ULOG_WARNING("SoundService: %s has an implausible chunk size %lu", path, static_cast<unsigned long>(chunk.size));
+      break;
+    }
+
+    bool seek_ok = true;
     if (memcmp(chunk.id, "fmt ", 4) == 0) {
       const size_t to_read = etl::min(chunk.size, static_cast<uint32_t>(sizeof(fmt)));
       if (playback_file_.read(&fmt, to_read) != static_cast<int>(to_read)) break;
-      if (chunk.size > to_read) playback_file_.seek(static_cast<lfs_soff_t>(chunk.size - to_read), LFS_SEEK_CUR);
-      if (chunk.size & 1) playback_file_.seek(1, LFS_SEEK_CUR);  // RIFF chunks are word-aligned
       have_fmt = true;
+      if (chunk.size > to_read) {
+        seek_ok = playback_file_.seek(static_cast<lfs_soff_t>(chunk.size - to_read), LFS_SEEK_CUR) >= 0;
+      }
+      if (seek_ok && (chunk.size & 1)) {  // RIFF chunks are word-aligned
+        seek_ok = playback_file_.seek(1, LFS_SEEK_CUR) >= 0;
+      }
     } else if (memcmp(chunk.id, "data", 4) == 0) {
       data_size = chunk.size;  // file position is now at the first PCM sample
       break;
     } else {
-      playback_file_.seek(static_cast<lfs_soff_t>(chunk.size + (chunk.size & 1)), LFS_SEEK_CUR);
+      seek_ok = playback_file_.seek(static_cast<lfs_soff_t>(chunk.size + (chunk.size & 1)), LFS_SEEK_CUR) >= 0;
     }
+    if (!seek_ok) {
+      ULOG_WARNING("SoundService: %s seek failed while walking chunks", path);
+      break;
+    }
+
+    const lfs_soff_t new_pos = playback_file_.seek(0, LFS_SEEK_CUR);
+    if (new_pos <= pos) {
+      ULOG_WARNING("SoundService: %s chunk walk stalled (position did not advance)", path);
+      break;
+    }
+    pos = new_pos;
   }
 
   if (!have_fmt || data_size == 0) {
     ULOG_WARNING("SoundService: %s has no fmt/data chunk", path);
     playback_file_.close();
+    chMtxUnlock(&playback_mutex_);
     return;
   }
   if (fmt.audio_format != kWavFormatPcm || fmt.num_channels != kWavChannelsMono ||
@@ -175,10 +225,13 @@ void SoundService::PlayTrack(uint8_t n) {
         path, fmt.audio_format, fmt.num_channels, fmt.bits_per_sample, static_cast<unsigned long>(fmt.sample_rate),
         static_cast<unsigned long>(xbot::driver::audio::kSampleRateHz));
     playback_file_.close();
+    chMtxUnlock(&playback_mutex_);
     return;
   }
 
   remaining_samples_ = data_size / sizeof(int16_t);
+  chMtxUnlock(&playback_mutex_);
+
   xbot::driver::audio::Play(&FeedFromFile);
 }
 

@@ -81,7 +81,7 @@ class SoundService {
   void ThreadFunc();
 
   thread_t* thread_ = nullptr;
-  THD_WORKING_AREA(wa_, 1024);
+  THD_WORKING_AREA(wa_, 2048);
 };
 
 #endif  // SOUND_SERVICE_HPP
