@@ -139,20 +139,27 @@ void DiffDriveService::tick() {
     UpdateOpenLoopCommand();
   }
 
-  // duty_loop's command comes from the PI in ProcessStatusUpdate(), which only runs on
-  // ESC telemetry. If telemetry stops while Control Twist keeps arriving (e.g. a
-  // receive-only UART failure), the 1 s command timeout above never fires, so without
-  // this the last PI output would be re-sent forever. Stop instead of latching it.
-  if (ControlMode.value == kControlModeDutyLoop &&
-      xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > kEscTelemetryTimeoutUs) {
-    speed_l_ = speed_r_ = 0;
-    integ_l_ = integ_r_ = 0;
-    pi_prev_l_ = pi_prev_r_ = 0;
-    meas_filt_l_ = meas_filt_r_ = 0;
-    // Force the next status pair to open a fresh tick window instead of measuring the
-    // tacho delta across the whole stale gap, which would publish a bogus velocity
-    // spike into the odometry consumer on reconnect.
+  const bool esc_telemetry_stale =
+      xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > kEscTelemetryTimeoutUs;
+
+  if (esc_telemetry_stale) {
+    // Make the next status pair open a fresh odometry window rather than differencing against
+    // the pre-gap count. An ESC that rebooted during the gap (power_service cycles ESC power)
+    // restarts its tacho at 0, so that difference would publish a large bogus velocity. This is
+    // not mode-specific - the odometry is computed the same way in both control modes.
     last_ticks_valid = false;
+  }
+
+  // duty_loop's command comes from the PI in ProcessStatusUpdate(), which only runs on ESC
+  // telemetry. If telemetry stops while Control Twist keeps arriving (e.g. a receive-only UART
+  // failure), the command timeout above never fires, so without this the last PI output would be
+  // re-sent forever. Reset the whole chain rather than just the actuator half: leaving the
+  // limiter history and per-wheel targets at the pre-stall speed would let the feedforward step
+  // straight back to that duty against a now-stationary machine when telemetry returns. Going
+  // through ResetControlState() is what the command timeout above does, so both stops resume by
+  // ramping the setpoint from standstill.
+  if (esc_telemetry_stale && ControlMode.value == kControlModeDutyLoop) {
+    ResetControlState();
   }
 
   // Stop commanding while power_service is intentionally idling the ESCs, so the
