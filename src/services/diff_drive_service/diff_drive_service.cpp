@@ -139,6 +139,22 @@ void DiffDriveService::tick() {
     UpdateOpenLoopCommand();
   }
 
+  // duty_loop's command comes from the PI in ProcessStatusUpdate(), which only runs on
+  // ESC telemetry. If telemetry stops while Control Twist keeps arriving (e.g. a
+  // receive-only UART failure), the 1 s command timeout above never fires, so without
+  // this the last PI output would be re-sent forever. Stop instead of latching it.
+  if (ControlMode.value == kControlModeDutyLoop &&
+      xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > kEscTelemetryTimeoutUs) {
+    speed_l_ = speed_r_ = 0;
+    integ_l_ = integ_r_ = 0;
+    pi_prev_l_ = pi_prev_r_ = 0;
+    meas_filt_l_ = meas_filt_r_ = 0;
+    // Force the next status pair to open a fresh tick window instead of measuring the
+    // tacho delta across the whole stale gap, which would publish a bogus velocity
+    // spike into the odometry consumer on reconnect.
+    last_ticks_valid = false;
+  }
+
   // Stop commanding while power_service is intentionally idling the ESCs, so the
   // xESC command-timeout releases the motor and the gate driver can sleep.
   if (!command_sent_ && !power_service.EscPowerIsOff()) {
@@ -149,7 +165,7 @@ void DiffDriveService::tick() {
   right_esc_driver_->RequestStatus();
 
   // Check, if we have received ESC status updates recently. If not, send a disconnected message
-  if (xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > 1'000'000) {
+  if (xbot::service::system::getTimeMicros() - last_valid_esc_state_micros_ > kEscTelemetryTimeoutUs) {
     const auto no_data_status = power_service.EscPowerIsOff()
                                     ? MotorDriver::ESCState::ESCStatus::ESC_STATUS_POWERED_OFF
                                     : MotorDriver::ESCState::ESCStatus::ESC_STATUS_DISCONNECTED;

@@ -29,6 +29,9 @@ class DiffDriveService : public DiffDriveServiceBase {
   bool left_esc_state_valid_ = false;
   bool right_esc_state_valid_ = false;
   uint32_t last_valid_esc_state_micros_ = 0;
+  // Shared by the ESC-status-disconnect check and the duty_loop stale-telemetry stop in
+  // tick(), so the two can never drift apart.
+  static constexpr uint32_t kEscTelemetryTimeoutUs = 1'000'000;
   static constexpr uint8_t ESC_LEFT = 1 << 0;
   static constexpr uint8_t ESC_RIGHT = 1 << 1;
   etl::atomic<uint8_t> escs_connected_{0};
