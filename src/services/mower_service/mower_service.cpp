@@ -84,7 +84,14 @@ void MowerService::tick() {
     // We got recent data, send it
     StartTransaction();
     SendMowerESCTemperature(esc_state_.temperature_pcb);
+    // Despite the name, this is the battery-side INPUT current, not the motor
+    // phase current -- under a duty-mode stall it FALLS rather than rises (the
+    // ESC's current controller cuts duty to hold phase current at its own
+    // limit), so it is the wrong number to threshold a stall against. Kept as
+    // "Mower Motor Current" (id 5) for compatibility; see id 10 below for the
+    // real motor current.
     SendMowerMotorCurrent(esc_state_.current_input);
+    SendMowerMotorPhaseCurrent(esc_state_.current_motor);
 
     // Stall detection. The ESC has no concept of stall: a duty-commanded
     // locked rotor regulates phase current down to its limit and sits below
