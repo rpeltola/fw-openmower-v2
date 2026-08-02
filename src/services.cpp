@@ -19,6 +19,7 @@ InputService input_service{xbot::service_ids::INPUT};
 HighLevelService high_level_service{xbot::service_ids::HIGH_LEVEL};
 FilesystemService filesystem_service{xbot::service_ids::FILESYSTEM};
 AudioService audio_service{xbot::service_ids::AUDIO};
+SecurityService security_service{xbot::service_ids::SECURITY};
 
 void StartServices() {
 #define START_IF_NEEDED(service, id)                \
@@ -58,6 +59,8 @@ void StartServices() {
   START_IF_NEEDED(audio_service, AUDIO)
   START_IF_NEEDED(imu_service, IMU)
   START_IF_NEEDED(power_service, POWER)
+  // Depends on EmergencyService (LIFT reasons) and PowerService (dock/charger presence) being up.
+  START_IF_NEEDED(security_service, SECURITY)
   START_IF_NEEDED(diff_drive, DIFF_DRIVE)
   START_IF_NEEDED(mower_service, MOWER)
   START_IF_NEEDED(gps_service, GPS)
