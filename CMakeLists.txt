@@ -92,6 +92,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         src/services/filesystem_service/filesystem_service.cpp
         src/services/audio_service/audio_service.cpp
         src/services/audio_service/tone_source.cpp
+        src/services/audio_service/stream_source.cpp
         # I2S6 audio driver (SPI6/I2S6 -> MAX98357A)
         src/drivers/audio/i2s6_audio.cpp
         # BQ2567 driver
