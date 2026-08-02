@@ -12,6 +12,7 @@
 #include "services/input_service/input_service.hpp"
 #include "services/mower_service/mower_service.hpp"
 #include "services/power_service/power_service.hpp"
+#include "services/security_service/security_service.hpp"
 
 extern EmergencyService emergency_service;
 extern DiffDriveService diff_drive;
@@ -24,6 +25,7 @@ extern InputService input_service;
 extern HighLevelService high_level_service;
 extern FilesystemService filesystem_service;
 extern AudioService audio_service;
+extern SecurityService security_service;
 
 void StartServices();
 

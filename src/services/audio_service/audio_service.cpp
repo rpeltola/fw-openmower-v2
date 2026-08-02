@@ -20,6 +20,7 @@
 #include <filesystem/filesystem.hpp>
 
 #include "services.hpp"
+#include "stream_source.hpp"
 #include "tone_source.hpp"
 
 using xbot::datatypes::RpcStatus;
@@ -167,6 +168,32 @@ constexpr uint16_t kSafetyVolumeFloor = 205;
 
 constexpr uint32_t kStartupGraceMs = 10'000;  // see CheckEmergencyEdges()
 constexpr uint32_t kBootChimeDelayMs = 1'500;
+
+// ---- Stream Frame wire format (issue #122) ----
+
+#pragma pack(push, 1)
+struct StreamFrameHeader {
+  uint16_t seq;
+  uint8_t flags;  ///< reserved for future use (e.g. end-of-utterance marker); unused today
+  uint8_t reserved;
+};
+#pragma pack(pop)
+static_assert(sizeof(StreamFrameHeader) == 4, "StreamFrameHeader must match the documented 4-byte layout");
+
+// The service definition declares "Stream Frame" as uint8_t[1288], but that is only an upper
+// bound for the CBOR description - the generated dispatcher's length check for a uint8_t[]
+// input is `length % sizeof(uint8_t) != 0`, which is always false, so nothing on the wire
+// actually enforces a fixed size. OnStreamFrameChanged() below therefore derives the sample
+// count from the frame it actually received rather than assuming one, which is strictly more
+// robust: it plays correctly whether ROS sends the intended 640-sample/1284-byte frame (40 ms
+// @ 16 kHz, matching its pacing - see stream::kNominalFrameSamples) or a padded 1288-byte one,
+// and a 4-byte disagreement between "the" frame size and the schema's declared maximum can
+// never silently drop every single frame. kStreamFrameMaxSamples exists only to reject an
+// implausible/garbled length (bigger than the schema's declared maximum), not to validate "the"
+// frame size.
+constexpr size_t kStreamFrameMaxSamples = (1288 - sizeof(StreamFrameHeader)) / sizeof(int16_t);
+static_assert(kStreamFrameMaxSamples >= stream::kNominalFrameSamples,
+              "declared Stream Frame maximum must be able to fit the nominal 40 ms frame");
 
 // Pure builder: fills the caller's program without touching the tone generator, so callers can
 // validate a request BEFORE retiring whatever is currently playing - an invalid request must
@@ -383,11 +410,35 @@ uint32_t AudioService::OnLoop(uint32_t now_micros, uint32_t) {
     return 1'000'000;
   }
 
+  // Prebuffer -> playback transition: a stream sits here with the voice already claimed
+  // (playing_class_ set in StartStream()) but the driver not yet running until 200 ms of audio
+  // has accumulated, so a burst of early network jitter doesn't immediately underrun it.
+  if (stream_open_ && !stream_playing_ && stream::PrebufferReady()) {
+    const uint16_t volume = ApplyClassVolume(static_cast<AudioClass>(playing_class_));
+    xbot::driver::audio::Play(&stream::FeedStream);
+    stream_playing_ = true;
+    ULOG_INFO("AudioService: stream playback started (class=%u, volume=%u)", playing_class_, volume);
+  }
+
+  // Sustained underrun (ring empty for > 500 ms): FeedStream() conceals a dry ring with silence
+  // rather than ever reporting a short read (which would make the driver latch end-of-stream),
+  // so nothing here would otherwise notice a stream that has gone silent - poll for it instead.
+  if (stream_open_ && stream_playing_ && stream::TakeUnderrunExceeded()) {
+    ULOG_WARNING("AudioService: stream underrun exceeded 500 ms, auto-stopping (class=%u)", playing_class_);
+    xbot::driver::audio::Stop();
+    ReleaseStreamSlot();
+    playing_class_ = 0;
+    SendPlayingClass(0);
+  }
+
   // Playback-finished edge: free the voice and tell the world. Fires once per completed
   // playback (playing_class_ only transitions to nonzero on a successful Start*), so this can't
-  // spam the log the way a per-loop check would.
-  if (playing_class_ != 0 && !xbot::driver::audio::IsPlaying()) {
+  // spam the log the way a per-loop check would. Excludes a stream still in its prebuffer
+  // window (stream_open_ && !stream_playing_): IsPlaying() is legitimately false there without
+  // anything having finished - see StartStream()/the class doc comment.
+  if (playing_class_ != 0 && !xbot::driver::audio::IsPlaying() && !(stream_open_ && !stream_playing_)) {
     ULOG_INFO("AudioService: playback finished (class=%u)", playing_class_);
+    ReleaseStreamSlot();  // no-op unless what just finished was a draining stream (Stop Stream flush=0)
     playing_class_ = 0;
     SendPlayingClass(playing_class_);
   }
@@ -472,6 +523,19 @@ void AudioService::RequestNamed(const char* name, AudioClass audio_class) {
   chMtxUnlock(&req_mtx_);
 }
 
+void AudioService::RequestPath(const char* path, AudioClass audio_class) {
+  chMtxLock(&req_mtx_);
+  if (!pending_.valid || U8(audio_class) >= pending_.audio_class) {
+    pending_.valid = true;
+    pending_.is_tone = false;
+    pending_.is_path = true;
+    pending_.audio_class = U8(audio_class);
+    strncpy(pending_.name, path, sizeof(pending_.name) - 1);
+    pending_.name[sizeof(pending_.name) - 1] = '\0';
+  }
+  chMtxUnlock(&req_mtx_);
+}
+
 void AudioService::DrainPending() {
   Request req;
   chMtxLock(&req_mtx_);
@@ -482,6 +546,8 @@ void AudioService::DrainPending() {
   if (!req.valid || !ValidClassByte(req.audio_class)) return;
   if (req.is_tone) {
     StartTone(static_cast<TonePattern>(req.pattern), static_cast<AudioClass>(req.audio_class), 0, 0, 0);
+  } else if (req.is_path) {
+    StartPath(req.name, static_cast<AudioClass>(req.audio_class));
   } else {
     StartNamed(req.name, strnlen(req.name, sizeof(req.name)), static_cast<AudioClass>(req.audio_class));
   }
@@ -489,7 +555,16 @@ void AudioService::DrainPending() {
 
 bool AudioService::ArbitrateStart(AudioClass audio_class) {
   // Equal class preempts (last-wins, matching the old PlayTrack behaviour); lower is dropped.
-  return !(xbot::driver::audio::IsPlaying() && U8(audio_class) < playing_class_);
+  // Voice ownership is normally exactly xbot::driver::audio::IsPlaying() (unchanged from before
+  // streaming existed - a WAV/tone that just finished naturally drops arbitration the instant
+  // the driver mutes, without waiting for OnLoop()'s "playback finished" edge to catch up and
+  // clear playing_class_). A stream is the one case where the voice is claimed before the driver
+  // is literally running: StartStream() sets playing_class_ up front, but Play() isn't called
+  // until its 200 ms prebuffer fills (see stream_playing_) - added as an explicit OR here rather
+  // than switching the whole check to playing_class_, so that narrow prebuffer window doesn't
+  // change WAV/tone arbitration timing at all.
+  const bool voice_claimed = xbot::driver::audio::IsPlaying() || (stream_open_ && !stream_playing_);
+  return !(voice_claimed && U8(audio_class) < playing_class_);
 }
 
 uint16_t AudioService::ApplyClassVolume(AudioClass audio_class) {
@@ -553,6 +628,28 @@ uint8_t AudioService::StartNamed(const char* name, size_t name_len, AudioClass a
   return Res(AudioResult::ERR_NOENT);
 }
 
+uint8_t AudioService::StartPath(const char* path, AudioClass audio_class) {
+  // No name resolution, no /user prefix: path is used exactly as given. Callers own keeping
+  // it out of reach of anything RPC-driven (see RequestPath()).
+  if (!driver_ok_) {
+    return Res(AudioResult::ERR_INVAL);
+  }
+  if (!ArbitrateStart(audio_class)) {
+    return Res(AudioResult::ERR_DROPPED);
+  }
+  if (!FileExists(path) || !ValidateWav(path)) {
+    return Res(AudioResult::ERR_NOENT);
+  }
+  const uint16_t volume = ApplyClassVolume(audio_class);
+  if (!PlayPath(path)) {
+    return Res(AudioResult::ERR_NOENT);  // validated a moment ago; only a delete race gets here
+  }
+  playing_class_ = U8(audio_class);
+  SendPlayingClass(playing_class_);
+  ULOG_INFO("AudioService: playing path '%s' (class=%u, volume=%u)", path, U8(audio_class), volume);
+  return Res(AudioResult::OK);
+}
+
 uint8_t AudioService::StartTone(TonePattern pattern, AudioClass audio_class, uint16_t freq, uint16_t duration_ms,
                                 uint8_t count) {
   if (!driver_ok_) {
@@ -569,10 +666,12 @@ uint8_t AudioService::StartTone(TonePattern pattern, AudioClass audio_class, uin
     return Res(AudioResult::ERR_DROPPED);
   }
 
-  // Retire any running stream before loading the program: FeedTone() must never render a
-  // half-swapped program, and Play() below re-primes the DMA buffers from scratch.
+  // Retire whatever is currently playing before loading the program: FeedTone() must never
+  // render a half-swapped program, and Play() below re-primes the DMA buffers from scratch.
   xbot::driver::audio::Stop();
-  CloseStream();  // a WAV we just preempted would otherwise keep its lfs handle open forever
+  CloseStream();        // a WAV we just preempted would otherwise keep its lfs handle open forever
+  ReleaseStreamSlot();  // likewise for a ROS PCM stream we just preempted (issue #122) - its ring
+                        // buffer would otherwise stay allocated forever with the slot stuck claimed
   tone::SetToneProgram(segs, n, repeats, amplitude);
   const uint16_t volume = ApplyClassVolume(audio_class);
   xbot::driver::audio::Play(&tone::FeedTone);
@@ -594,6 +693,8 @@ bool AudioService::PlayPath(const char* path) {
   // only audio_mutex_ and is called with playback_mutex_ NOT held, which keeps the lock order
   // one-directional.
   xbot::driver::audio::Stop();
+  ReleaseStreamSlot();  // a ROS PCM stream (issue #122) we just preempted must not keep its ring
+                        // buffer allocated / the slot stuck claimed once it has lost the voice
 
   // Held from the close of a possibly still-playing previous handle through to the point
   // remaining_samples_ is committed, so FeedFromFile() (feeder thread) can never observe the
@@ -623,6 +724,72 @@ bool AudioService::PlayPath(const char* path) {
   return true;
 }
 
+uint8_t AudioService::StartStream(AudioClass audio_class) {
+  if (!driver_ok_) {
+    return Res(AudioResult::ERR_INVAL);
+  }
+  if (stream_open_) {
+    // Single stream slot: unconditional, unlike the class arbitration below - the caller must
+    // Stop Stream its own stream before it (or anyone else) can open a new one.
+    return Res(AudioResult::ERR_BUSY);
+  }
+  if (!ArbitrateStart(audio_class)) {
+    return Res(AudioResult::ERR_DROPPED);
+  }
+  if (!stream::Open()) {
+    return Res(AudioResult::ERR_INVAL);  // ring allocation failed; stream::Open() already logged it
+  }
+
+  // Retire whatever is currently playing, exactly like StartTone()/PlayPath() do. No
+  // ReleaseStreamSlot() needed here: stream_open_ was just checked false above.
+  xbot::driver::audio::Stop();
+  CloseStream();
+
+  const uint16_t volume = ApplyClassVolume(audio_class);
+  playing_class_ = U8(audio_class);
+  stream_open_ = true;
+  stream_playing_ = false;  // Play() isn't called until the 200 ms prebuffer fills - see OnLoop()
+  SendPlayingClass(playing_class_);
+  SendStreamActive(1);
+  status_schedule_.SetInterval(200'000);  // 5 Hz while a stream is active, paces the ROS sender
+  ULOG_INFO("AudioService: stream opened (class=%u, volume=%u)", U8(audio_class), volume);
+  return Res(AudioResult::OK);
+}
+
+uint8_t AudioService::StopStream(bool flush) {
+  if (!stream_open_) {
+    return Res(AudioResult::ERR_INVAL);
+  }
+
+  if (flush || !stream_playing_) {
+    // An explicit cut, or a stream that never actually started (still in its prebuffer window)
+    // and so has nothing to drain either way: stop the driver synchronously (a harmless no-op
+    // if Play() was never called for this stream - DisableHardwareLocked() is idempotent) and
+    // release the slot immediately.
+    xbot::driver::audio::Stop();
+    ReleaseStreamSlot();
+    playing_class_ = 0;
+    SendPlayingClass(0);
+  } else {
+    // flush=0: let the buffered audio play out. stream::Close() makes FeedStream() return a
+    // short read once the ring drains, which the driver treats exactly like an exhausted file
+    // or tone track (silence-pad the tail of that half, then auto-mute on the next one) -
+    // OnLoop()'s "playback finished" check notices IsPlaying() go false and calls
+    // ReleaseStreamSlot() from there.
+    stream::Close();
+  }
+  return Res(AudioResult::OK);
+}
+
+void AudioService::ReleaseStreamSlot() {
+  if (!stream_open_) return;
+  stream::Release();
+  stream_open_ = false;
+  stream_playing_ = false;
+  SendStreamActive(0);
+  status_schedule_.SetInterval(1'000'000);
+}
+
 void AudioService::RPCPlayLocal(uint16_t call_id, const char* Name, uint32_t NameLen, uint8_t Class) {
   uint8_t r =
       ValidClassByte(Class) ? StartNamed(Name, NameLen, static_cast<AudioClass>(Class)) : Res(AudioResult::ERR_INVAL);
@@ -637,6 +804,16 @@ void AudioService::RPCPlayTone(uint16_t call_id, uint8_t Pattern, uint8_t Class,
   SendRpcResponse(call_id, RpcStatus::SUCCESS, &r, 1);
 }
 
+void AudioService::RPCStartStream(uint16_t call_id, uint8_t Class) {
+  uint8_t r = ValidClassByte(Class) ? StartStream(static_cast<AudioClass>(Class)) : Res(AudioResult::ERR_INVAL);
+  SendRpcResponse(call_id, RpcStatus::SUCCESS, &r, 1);
+}
+
+void AudioService::RPCStopStream(uint16_t call_id, uint8_t Flush) {
+  uint8_t r = StopStream(Flush != 0);
+  SendRpcResponse(call_id, RpcStatus::SUCCESS, &r, 1);
+}
+
 void AudioService::OnMasterVolumeChanged(const uint16_t& new_value) {
   master_volume_.store(etl::min<uint16_t>(new_value, 256));
   if (ValidClassByte(playing_class_)) {
@@ -648,11 +825,37 @@ void AudioService::OnQuietModeChanged(const uint8_t& new_value) {
   quiet_mode_.store(new_value != 0);
 }
 
+void AudioService::OnStreamFrameChanged(const uint8_t* new_value, uint32_t length) {
+  if (!stream_open_) return;  // no stream slot claimed; a stray/late frame is simply ignored
+  if (length < sizeof(StreamFrameHeader)) {
+    ULOG_WARNING("AudioService: stream frame shorter than its header (%lu bytes) - dropping (ERR_INVAL)",
+                 static_cast<unsigned long>(length));
+    return;
+  }
+
+  // Sample count is derived from the payload actually received rather than assumed - see the
+  // comment above kStreamFrameMaxSamples for why. A trailing odd byte (shouldn't happen, but
+  // harmless if it does) is silently dropped by the integer division rather than failing the
+  // whole frame.
+  const uint32_t payload_bytes = length - sizeof(StreamFrameHeader);
+  const size_t n_samples = payload_bytes / sizeof(int16_t);
+  if (n_samples > kStreamFrameMaxSamples) {
+    ULOG_WARNING("AudioService: stream frame implies %u samples (> max %u) - dropping (ERR_INVAL)",
+                 static_cast<unsigned>(n_samples), static_cast<unsigned>(kStreamFrameMaxSamples));
+    return;
+  }
+
+  StreamFrameHeader header;
+  memcpy(&header, new_value, sizeof(header));
+  const auto* samples = reinterpret_cast<const int16_t*>(new_value + sizeof(header));
+  stream::PushFrame(header.seq, samples, n_samples);
+}
+
 void AudioService::SendStatus() {
   SendPlayingClass(playing_class_);
-  SendAlarmState(0);
-  // Streaming isn't implemented yet; the fields exist so the wire format is already stable.
-  SendBufferFreeBytes(0);
-  SendUnderruns(0);
-  SendStreamActive(0);
+  // Alarm State (output id 1) was retired in service definition v2 - alarm state now belongs to
+  // a separate SecurityService, not this one.
+  SendBufferFreeBytes(stream_open_ ? stream::FreeBytes() : 0);
+  SendUnderruns(stream::UnderrunEvents());
+  SendStreamActive(stream_open_ ? 1 : 0);
 }
