@@ -108,7 +108,7 @@ void MowerService::ESCCallback(const MotorDriver::ESCState& state) {
 
 void MowerService::SetDuty() {
   // Get the current emergency state
-  bool emergency = emergency_service.GetEmergencyReasons() != 0;
+  bool emergency = emergency_service.GetBladeBlockReasons() != 0;
   if (emergency) {
     mower_driver_->SetDuty(0);
   } else {
@@ -143,7 +143,7 @@ bool MowerService::IsHealthy() {
   return power_service.EscPowerIsOff() || (IsRunning() && esc_ever_connected_);
 }
 void MowerService::OnEmergencyChangedEvent() {
-  bool emergency = emergency_service.GetEmergencyReasons() != 0;
+  bool emergency = emergency_service.GetBladeBlockReasons() != 0;
   if (!emergency) {
     // only set speed to 0 if the emergency happens, not if it's cleared
     return;

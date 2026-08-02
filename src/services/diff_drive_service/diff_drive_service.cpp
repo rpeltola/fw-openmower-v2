@@ -6,6 +6,7 @@
 
 #include <ulog.h>
 
+#include <cmath>
 #include <drivers/motor/motor_driver.hpp>
 #include <services.hpp>
 #include <xbot-service/portable/system.hpp>
@@ -13,7 +14,7 @@
 using namespace xbot::driver::motor;
 
 void DiffDriveService::OnEmergencyChangedEvent() {
-  bool emergency = emergency_service.GetEmergencyReasons() != 0;
+  bool emergency = emergency_service.GetDriveBlockReasons() != 0;
   if (!emergency) {
     // only set speed to 0 if the emergency happens, not if it's cleared
     return;
@@ -46,6 +47,23 @@ void DiffDriveService::UpdateCommand(float dt) {
   limiter_lin_.min_acceleration = -accel_limit;
   float v = cmd_v_;
   float w = cmd_w_;
+  // Inverse-kinematics half track, needed both for the unlock speed cap and the
+  // per-wheel targets below.
+  const float half_track = 0.5f * static_cast<float>(WheelDistance.value);
+  // While a drive unlock is suppressing the drive-side consequence of a lift
+  // emergency, the firmware caps the speed itself - the high level asking nicely is
+  // not enough. Scale the whole twist by one factor rather than clamping v and w
+  // separately, so the commanded arc keeps its shape while the fastest wheel stays
+  // within the cap. Applied before the limiter so the acceleration shaping and the
+  // limiter history see the command that is actually executed.
+  if (emergency_service.IsDriveUnlockActive()) {
+    const float peak_wheel_speed = fabsf(v) + fabsf(w) * half_track;
+    if (peak_wheel_speed > kUnlockSpeedCapMps) {
+      const float scale = kUnlockSpeedCapMps / peak_wheel_speed;
+      v *= scale;
+      w *= scale;
+    }
+  }
   limiter_lin_.limit(v, last0_v_, last1_v_, dt);
   limiter_ang_.limit(w, last0_w_, last1_w_, dt);
   last1_v_ = last0_v_;
@@ -54,7 +72,6 @@ void DiffDriveService::UpdateCommand(float dt) {
   last0_w_ = w;
   // Inverse kinematics: per-wheel linear speed [m/s]. The right wheel is mounted
   // mirrored, so its target is negated (same frame as its measured speed).
-  const float half_track = 0.5f * static_cast<float>(WheelDistance.value);
   target_v_l_ = v - w * half_track;
   target_v_r_ = -(v + w * half_track);
 }
@@ -192,7 +209,7 @@ void DiffDriveService::tick() {
 
 void DiffDriveService::SendMotorCommand() {
   // Get the current emergency state. On emergency we always command 0.
-  bool emergency = emergency_service.GetEmergencyReasons() != 0;
+  bool emergency = emergency_service.GetDriveBlockReasons() != 0;
   // Both duty and duty_loop output a duty cycle in [-1, 1].
   const float cmd_l = emergency ? 0.0f : speed_l_;
   const float cmd_r = emergency ? 0.0f : speed_r_;

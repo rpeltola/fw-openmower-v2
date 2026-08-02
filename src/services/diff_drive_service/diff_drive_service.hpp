@@ -82,6 +82,10 @@ class DiffDriveService : public DiffDriveServiceBase {
                             kMaxAngAccRps2, 0.0f, 0.0f};
   // tick() period [s], must match tick_schedule_ (20 ms). Used as dt for the limiter.
   static constexpr float kTickPeriodS = 0.02f;
+  // Peak wheel speed [m/s] allowed while a drive unlock is active (wheel-lift escape).
+  // This is the firmware's own bound on an override manoeuvre; the high level applies
+  // its own, lower, limits on top.
+  static constexpr float kUnlockSpeedCapMps = 0.2f;
 
   // --- Firmware speed loop (duty_loop) --------------------------------------
   // Per-wheel target wheel speed [m/s] from the inverse kinematics. Right wheel is
