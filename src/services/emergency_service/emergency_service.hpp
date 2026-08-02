@@ -23,13 +23,11 @@ class EmergencyService : public EmergencyServiceBase {
   }
 
   uint16_t GetEmergencyReasons();
-  // The blade path reads this: the raw reasons, which no unlock mask can ever reach.
-  // "A lift sensor is active => the blade is dead" is therefore structural, not a
-  // convention that a later feature could quietly break.
+  // Raw reasons - the blade path reads this; a drive unlock can never reach it.
   uint16_t GetBladeBlockReasons();
-  // The drive path reads this: the reasons minus whatever a scoped drive unlock is
-  // currently suppressing. The mask is always 0 until the unlock primitive exists, so
-  // this is behaviour-identical to GetEmergencyReasons() for now.
+  // Reasons minus the currently active drive-unlock mask. Only
+  // LIFT/LIFT_MULTIPLE/LATCH are ever suppressible; everything else always
+  // blocks drive too.
   uint16_t GetDriveBlockReasons();
   bool IsDriveUnlockActive();
   uint32_t CheckInputs(uint32_t now);
@@ -40,10 +38,13 @@ class EmergencyService : public EmergencyServiceBase {
   void OnStop() override;
   uint32_t OnLoop(uint32_t now_micros, uint32_t last_tick_micros) override;
   void OnHighLevelEmergencyChanged(const uint16_t* new_value, uint32_t length) override;
+  void OnDriveUnlockRequestChanged(const uint16_t* new_value, uint32_t length) override;
 
  private:
   uint32_t CheckTimeouts(uint32_t now);
   uint32_t CheckRequiredServices();
+  uint32_t CheckDriveUnlock(uint32_t now);
+  uint32_t CheckTilt(uint32_t now);
   void SendStatus();
   ServiceSchedule status_schedule_{*this, 1'000'000,
                                    XBOT_FUNCTION_FOR_METHOD(EmergencyService, &EmergencyService::SendStatus, this)};
@@ -55,9 +56,32 @@ class EmergencyService : public EmergencyServiceBase {
   uint16_t reasons_ = EmergencyReason::TIMEOUT_INPUTS | EmergencyReason::TIMEOUT_HIGH_LEVEL;
   uint32_t last_high_level_emergency_message_ = 0;
 
-  // Reasons whose DRIVE-side consequence is currently suppressed. Nothing sets this
-  // yet; it exists so the two getters above are the only place the distinction lives.
+  // Drive unlock session state. The mask suppresses drive-side consequences of
+  // the listed reasons only; it is dead-man renewed, session-capped and dropped
+  // on tilt. All transitions send Drive Unlock State so consumers render truth.
   uint16_t active_unlock_mask_ = 0;
+  uint32_t unlock_ttl_micros_ = kUnlockDefaultTtlMicros;
+  uint32_t last_unlock_renewal_micros_ = 0;
+  uint32_t unlock_session_start_micros_ = 0;
+  bool unlock_session_lockout_ = false;
+  uint32_t tilt_over_limit_since_micros_ = 0;
+  bool tilt_over_limit_ = false;
+  uint32_t tilt_estop_over_since_micros_ = 0;
+  bool tilt_estop_over_ = false;
+  uint32_t tilt_estop_under_since_micros_ = 0;
+
+  static constexpr uint16_t kUnlockableMask =
+      EmergencyReason::LIFT | EmergencyReason::LIFT_MULTIPLE | EmergencyReason::LATCH;
+  static constexpr uint32_t kUnlockDefaultTtlMicros = 500'000;
+  static constexpr uint32_t kUnlockMaxTtlMicros = 1'000'000;
+  static constexpr uint32_t kUnlockMinTtlMicros = 100'000;
+  static constexpr uint32_t kUnlockSessionCapMicros = 15'000'000;
+  static constexpr uint32_t kUnlockLockoutGapMicros = 1'000'000;
+  static constexpr float kUnlockTiltLimitDeg = 25.0f;
+  static constexpr uint32_t kUnlockTiltSustainMicros = 300'000;
+  static constexpr float kTiltEstopDeg = 45.0f;
+  static constexpr float kTiltEstopClearDeg = 40.0f;
+  static constexpr uint32_t kTiltEstopSustainMicros = 500'000;
 
   etl::vector<ServiceExt*, 16> required_services_{};
 };
