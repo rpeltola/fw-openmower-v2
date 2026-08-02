@@ -12,11 +12,19 @@
  * @brief Register-level SPI6/I2S6 -> MAX98357A I2S transmit driver.
  *
  * *** REQUIRES ON-HARDWARE BRING-UP ***
- * This driver has never been exercised against real silicon or the MAX98357A amp. Every
- * register value below is derived from RM0468 (STM32H723 reference manual) and this project's
- * actual clock-tree configuration (boards/XCORE/mcuconf.h), but it must still be verified with a
- * scope/logic analyzer before it is trusted:
+ * This driver has never been exercised against real silicon or the MAX98357A amp. A first live
+ * test (2026-08-02, see project issue #119) found total silence and traced it to dma_buffer_
+ * (SRAM4, cacheable) being read by BDMA - which bypasses the D-cache - without ever being
+ * cache-cleaned first, so BDMA could transmit stale/frozen buffer content indefinitely regardless
+ * of what RefillHalfLocked() had just written. i2s6_audio.cpp now flushes each half via
+ * cacheBufferFlush() right after filling it, but that fix is build-verified only, NOT yet
+ * confirmed against silicon. Every register value below is also derived from RM0468 (STM32H723
+ * reference manual) and this project's actual clock-tree configuration (boards/XCORE/mcuconf.h).
+ * None of it is trusted until it's verified with a scope/logic analyzer:
  *  - BCLK / WS / DOUT waveforms on PG13 / PA15 / PB5 (frequency, polarity, bit alignment).
+ *  - Audible, non-stale output on all three trigger paths (button_ack tone via the app's volume
+ *    slider is the simplest end-to-end check) - confirms the cache fix actually worked, not just
+ *    that it built.
  *  - The actual audible sample rate/pitch - see i2s6_audio.cpp, it is NOT exactly 16 kHz.
  *  - That DMAMUX2 request id 12 (STM32_DMAMUX2_SPI6_TX) really is "SPI6_TX" on this silicon
  *    revision (cross-check against RM0468's DMAMUX2 request mapping table if audio sounds wrong

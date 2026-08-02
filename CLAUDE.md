@@ -63,8 +63,9 @@ Unfixed items that will bite anyone working nearby:
   `decode_buf_`.
 - No IWDG/WWDG anywhere, and several unbounded init/recovery loops can hang a service
   thread with no watchdog to recover it.
-- Audio: `dma_buffer_` is cacheable in SRAM4 and never cleaned before DMA reads it, so
-  playback will not sound correct until that is addressed (needs HW validation).
+- Audio: `dma_buffer_`'s D-cache-vs-BDMA coherency (issue #119) is fixed on `personal`
+  (`cacheBufferFlush()` after every half-buffer write) — build-verified only, NOT YET
+  bench/HW-validated.
 
 ## Build / flash
 

@@ -383,8 +383,11 @@ uint32_t AudioService::OnLoop(uint32_t now_micros, uint32_t) {
     return 1'000'000;
   }
 
-  // Playback-finished edge: free the voice and tell the world.
+  // Playback-finished edge: free the voice and tell the world. Fires once per completed
+  // playback (playing_class_ only transitions to nonzero on a successful Start*), so this can't
+  // spam the log the way a per-loop check would.
   if (playing_class_ != 0 && !xbot::driver::audio::IsPlaying()) {
+    ULOG_INFO("AudioService: playback finished (class=%u)", playing_class_);
     playing_class_ = 0;
     SendPlayingClass(playing_class_);
   }
@@ -489,7 +492,7 @@ bool AudioService::ArbitrateStart(AudioClass audio_class) {
   return !(xbot::driver::audio::IsPlaying() && U8(audio_class) < playing_class_);
 }
 
-void AudioService::ApplyClassVolume(AudioClass audio_class) {
+uint16_t AudioService::ApplyClassVolume(AudioClass audio_class) {
   uint16_t volume = master_volume_.load();
   if (audio_class == AudioClass::ALARM) {
     volume = 256;
@@ -499,6 +502,7 @@ void AudioService::ApplyClassVolume(AudioClass audio_class) {
     volume = volume / 4;
   }
   xbot::driver::audio::SetVolume(volume);
+  return volume;
 }
 
 uint8_t AudioService::StartNamed(const char* name, size_t name_len, AudioClass audio_class) {
@@ -527,12 +531,14 @@ uint8_t AudioService::StartNamed(const char* name, size_t name_len, AudioClass a
   }
 
   if (path[0] != '\0') {
-    ApplyClassVolume(audio_class);
+    const uint16_t volume = ApplyClassVolume(audio_class);
     if (!PlayPath(path)) {
       return Res(AudioResult::ERR_NOENT);  // validated a moment ago; only a delete race gets here
     }
     playing_class_ = U8(audio_class);
     SendPlayingClass(playing_class_);
+    ULOG_INFO("AudioService: playing '%.*s' (class=%u, volume=%u)", static_cast<int>(name_len), name, U8(audio_class),
+              volume);
     return Res(AudioResult::OK);
   }
 
@@ -568,10 +574,12 @@ uint8_t AudioService::StartTone(TonePattern pattern, AudioClass audio_class, uin
   xbot::driver::audio::Stop();
   CloseStream();  // a WAV we just preempted would otherwise keep its lfs handle open forever
   tone::SetToneProgram(segs, n, repeats, amplitude);
-  ApplyClassVolume(audio_class);
+  const uint16_t volume = ApplyClassVolume(audio_class);
   xbot::driver::audio::Play(&tone::FeedTone);
   playing_class_ = U8(audio_class);
   SendPlayingClass(playing_class_);
+  ULOG_INFO("AudioService: playing tone pattern=%u (class=%u, volume=%u)", static_cast<uint8_t>(pattern),
+            U8(audio_class), volume);
   return Res(AudioResult::OK);
 }
 
