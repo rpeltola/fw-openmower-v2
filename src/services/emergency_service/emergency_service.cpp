@@ -69,6 +69,21 @@ uint16_t EmergencyService::GetEmergencyReasons() {
   return reasons_;
 }
 
+uint16_t EmergencyService::GetBladeBlockReasons() {
+  Lock lk{&mtx_};
+  return reasons_;
+}
+
+uint16_t EmergencyService::GetDriveBlockReasons() {
+  Lock lk{&mtx_};
+  return reasons_ & ~active_unlock_mask_;
+}
+
+bool EmergencyService::IsDriveUnlockActive() {
+  Lock lk{&mtx_};
+  return active_unlock_mask_ != 0;
+}
+
 void EmergencyService::RequireService(ServiceExt* svc) {
   Lock lk{&mtx_};
   required_services_.push_back(svc);

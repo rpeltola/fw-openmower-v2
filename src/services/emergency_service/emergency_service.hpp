@@ -23,6 +23,15 @@ class EmergencyService : public EmergencyServiceBase {
   }
 
   uint16_t GetEmergencyReasons();
+  // The blade path reads this: the raw reasons, which no unlock mask can ever reach.
+  // "A lift sensor is active => the blade is dead" is therefore structural, not a
+  // convention that a later feature could quietly break.
+  uint16_t GetBladeBlockReasons();
+  // The drive path reads this: the reasons minus whatever a scoped drive unlock is
+  // currently suppressing. The mask is always 0 until the unlock primitive exists, so
+  // this is behaviour-identical to GetEmergencyReasons() for now.
+  uint16_t GetDriveBlockReasons();
+  bool IsDriveUnlockActive();
   uint32_t CheckInputs(uint32_t now);
 
   void RequireService(ServiceExt* svc);
@@ -45,6 +54,10 @@ class EmergencyService : public EmergencyServiceBase {
 
   uint16_t reasons_ = EmergencyReason::TIMEOUT_INPUTS | EmergencyReason::TIMEOUT_HIGH_LEVEL;
   uint32_t last_high_level_emergency_message_ = 0;
+
+  // Reasons whose DRIVE-side consequence is currently suppressed. Nothing sets this
+  // yet; it exists so the two getters above are the only place the distinction lives.
+  uint16_t active_unlock_mask_ = 0;
 
   etl::vector<ServiceExt*, 16> required_services_{};
 };
