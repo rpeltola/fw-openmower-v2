@@ -56,7 +56,7 @@ void DiffDriveService::UpdateCommand(float dt) {
   // separately, so the commanded arc keeps its shape while the fastest wheel stays
   // within the cap. Applied before the limiter so the acceleration shaping and the
   // limiter history see the command that is actually executed.
-  if (emergency_service.IsDriveUnlockActive()) {
+  if (emergency_service.IsDriveUnlockSuppressing()) {
     const float peak_wheel_speed = fabsf(v) + fabsf(w) * half_track;
     if (peak_wheel_speed > kUnlockSpeedCapMps) {
       const float scale = kUnlockSpeedCapMps / peak_wheel_speed;
