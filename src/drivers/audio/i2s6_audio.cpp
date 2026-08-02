@@ -72,6 +72,14 @@ constexpr size_t kSamplesPerHalf = 512;
 constexpr size_t kWordsPerHalf = kSamplesPerHalf * kChannelsPerFrame;  // interleaved L,R
 constexpr size_t kTotalWords = kWordsPerHalf * 2;                      // two halves
 
+// Byte size of one half, i.e. exactly what cacheBufferFlush() must cover per RefillHalfLocked()
+// call. Required to already be a whole number of D-cache lines (see cache.h's cacheBufferFlush()
+// note) - true today (2048 B / 32 B lines) but asserted so a future kSamplesPerHalf change can't
+// silently leave part of a half unflushed or spill the flush onto the other half.
+constexpr size_t kHalfBufferBytes = kWordsPerHalf * sizeof(int16_t);
+static_assert(kHalfBufferBytes % CACHE_LINE_SIZE == 0,
+              "DMA half-buffer size must be a whole number of D-cache lines for cacheBufferFlush()");
+
 // DMA target buffer. BDMA1 (the only DMA controller wired to SPI6 via DMAMUX2, since SPI6 is in
 // the D3 power domain) can only address D3-domain RAM - SRAM4 at 0x38000000 - not AXI SRAM,
 // DTCM or AHB SRAM1-3. The `.ram4` section is a stock ChibiOS linker feature
@@ -79,7 +87,16 @@ constexpr size_t kTotalWords = kWordsPerHalf * 2;                      // two ha
 // boards/XCORE/STM32H723xG_ITCM64k.ld, and already used elsewhere in this firmware (see
 // CC_SECTION(".ram4") on board_info/carrier_board_info in globals.hpp) - so no linker changes
 // are needed here, just the same attribute.
-CC_SECTION(".ram4") int16_t dma_buffer_[kTotalWords];
+//
+// SRAM4 is cacheable on this core (mcuconf.h leaves STM32_NOCACHE_ENABLE FALSE - the MPU's
+// no-cache window covers AXI SRAM at 0x24000000, not SRAM4), and BDMA reads memory directly,
+// bypassing the D-cache entirely. Without an explicit flush after every write, BDMA can read back
+// stale/uninitialized SRAM4 content that never made it past the cache - total silence with an
+// otherwise fully-correct pipeline. CC_ALIGN_DATA(CACHE_LINE_SIZE) plus the kHalfBufferBytes
+// static_assert below (cache.h, pulled in transitively via <hal.h>) keep each half a whole
+// number of cache lines at a cache-line-aligned address, which cacheBufferFlush() requires to
+// avoid touching adjacent data. See RefillHalfLocked(), the only place dma_buffer_ is written.
+CC_ALIGN_DATA(CACHE_LINE_SIZE) CC_SECTION(".ram4") int16_t dma_buffer_[kTotalWords];
 
 const stm32_bdma_stream_t* dma_stream_ = nullptr;
 SampleSource source_ = nullptr;
@@ -140,6 +157,10 @@ void RefillHalfLocked(size_t half) {
                                     // whether it plays L, R or their average; L==R makes the
                                     // result correct regardless of which).
   }
+  // BDMA reads half_base directly from SRAM4, bypassing the D-cache - without this flush the
+  // writes above could sit in cache indefinitely and BDMA would keep transmitting whatever was
+  // there before (see the CC_ALIGN_DATA/kHalfBufferBytes comments above dma_buffer_'s definition).
+  cacheBufferFlush(half_base, kHalfBufferBytes);
 
   if (was_active && n < kSamplesPerHalf) {
     source_ = nullptr;  // end-of-stream: stop pulling further data

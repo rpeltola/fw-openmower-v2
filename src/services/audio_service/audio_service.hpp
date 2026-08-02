@@ -81,9 +81,9 @@ class AudioService : public AudioServiceBase {
   uint8_t StartNamed(const char* name, size_t name_len, AudioClass audio_class);
   uint8_t StartTone(TonePattern pattern, AudioClass audio_class, uint16_t freq, uint16_t duration_ms, uint8_t count);
 
-  bool ArbitrateStart(AudioClass audio_class);  ///< false = keep current sound, drop the request
-  void ApplyClassVolume(AudioClass audio_class);
-  bool PlayPath(const char* path);  ///< open + validate a WAV and start streaming it
+  bool ArbitrateStart(AudioClass audio_class);        ///< false = keep current sound, drop the request
+  uint16_t ApplyClassVolume(AudioClass audio_class);  ///< returns the volume it resolved and set
+  bool PlayPath(const char* path);                    ///< open + validate a WAV and start streaming it
   void CheckEmergencyEdges();
   void DrainPending();
   void SendStatus();
