@@ -67,6 +67,18 @@ class AudioService : public AudioServiceBase {
   void RequestTone(TonePattern pattern, AudioClass audio_class);
   void RequestNamed(const char* name, AudioClass audio_class);
 
+  /**
+   * @brief Like RequestNamed(), but plays an already-fully-qualified absolute path directly,
+   * bypassing the /user/audio name-resolution chain entirely.
+   *
+   * For callers whose sound deliberately lives outside the named-sound namespace and must
+   * stay unreachable through it - e.g. SecurityService's owner-identity clip under /cfg/owner,
+   * which the FilesystemService RPC sandbox (rooted at /user) cannot touch and which naming it
+   * as a resolvable sound would expose to Play Local. The path is trusted verbatim: callers
+   * must never construct one from untrusted/RPC-supplied input.
+   */
+  void RequestPath(const char* path, AudioClass audio_class);
+
  protected:
   bool OnStart() override;
   uint32_t OnLoop(uint32_t now_micros, uint32_t last_tick_micros) override;
@@ -85,9 +97,10 @@ class AudioService : public AudioServiceBase {
   struct Request {
     bool valid = false;
     bool is_tone = false;
+    bool is_path = false;  ///< see RequestPath(); mutually exclusive with is_tone
     uint8_t audio_class = 0;
     uint8_t pattern = 0;
-    char name[64]{};
+    char name[64]{};  ///< named sound, or (is_path) an absolute path
   };
 
   // Returns an AudioResult as its wire byte. All Start*/Stop* run on the service thread only.
@@ -95,6 +108,7 @@ class AudioService : public AudioServiceBase {
   uint8_t StartTone(TonePattern pattern, AudioClass audio_class, uint16_t freq, uint16_t duration_ms, uint8_t count);
   uint8_t StartStream(AudioClass audio_class);
   uint8_t StopStream(bool flush);
+  uint8_t StartPath(const char* path, AudioClass audio_class);
 
   bool ArbitrateStart(AudioClass audio_class);        ///< false = keep current sound, drop the request
   uint16_t ApplyClassVolume(AudioClass audio_class);  ///< returns the volume it resolved and set

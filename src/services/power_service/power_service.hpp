@@ -67,6 +67,15 @@ class PowerService : public PowerServiceBase {
     return esc_power_off_.load();
   }
 
+  // Debounced dock/charger-adapter-present state (see check_adapter_chime_()). Lock-free so
+  // other services' own threads - e.g. SecurityService's "not docked" arm gate - can poll it
+  // without touching mtx_. False (including before the first sample) reads as "not docked",
+  // which is the fail-safe direction for that gate: it can only make an alarm MORE reachable,
+  // never suppress one the owner is relying on.
+  [[nodiscard]] bool IsAdapterPresent() const {
+    return adapter_present_atomic_.load();
+  }
+
   [[nodiscard]] float GetAdcAdapterVolts() {
     xbot::service::Lock lk{&mtx_};
     return adapter_volts_adc_;
@@ -145,6 +154,8 @@ class PowerService : public PowerServiceBase {
   bool adapter_present_ = false;
   bool adapter_present_known_ = false;
   uint8_t adapter_edge_count_ = 0;
+  // Lock-free mirror of adapter_present_ for IsAdapterPresent(), written alongside it.
+  etl::atomic<bool> adapter_present_atomic_{false};
 
   CHARGER_STATUS charger_status_ = CHARGER_STATUS::COMMS_ERROR;
   ChargerDriver* charger_ = nullptr;

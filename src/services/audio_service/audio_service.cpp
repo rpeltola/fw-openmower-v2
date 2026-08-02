@@ -523,6 +523,19 @@ void AudioService::RequestNamed(const char* name, AudioClass audio_class) {
   chMtxUnlock(&req_mtx_);
 }
 
+void AudioService::RequestPath(const char* path, AudioClass audio_class) {
+  chMtxLock(&req_mtx_);
+  if (!pending_.valid || U8(audio_class) >= pending_.audio_class) {
+    pending_.valid = true;
+    pending_.is_tone = false;
+    pending_.is_path = true;
+    pending_.audio_class = U8(audio_class);
+    strncpy(pending_.name, path, sizeof(pending_.name) - 1);
+    pending_.name[sizeof(pending_.name) - 1] = '\0';
+  }
+  chMtxUnlock(&req_mtx_);
+}
+
 void AudioService::DrainPending() {
   Request req;
   chMtxLock(&req_mtx_);
@@ -533,6 +546,8 @@ void AudioService::DrainPending() {
   if (!req.valid || !ValidClassByte(req.audio_class)) return;
   if (req.is_tone) {
     StartTone(static_cast<TonePattern>(req.pattern), static_cast<AudioClass>(req.audio_class), 0, 0, 0);
+  } else if (req.is_path) {
+    StartPath(req.name, static_cast<AudioClass>(req.audio_class));
   } else {
     StartNamed(req.name, strnlen(req.name, sizeof(req.name)), static_cast<AudioClass>(req.audio_class));
   }
@@ -611,6 +626,28 @@ uint8_t AudioService::StartNamed(const char* name, size_t name_len, AudioClass a
 
   ULOG_INFO("AudioService: no sound for '%.*s' (no file, no default)", static_cast<int>(name_len), name);
   return Res(AudioResult::ERR_NOENT);
+}
+
+uint8_t AudioService::StartPath(const char* path, AudioClass audio_class) {
+  // No name resolution, no /user prefix: path is used exactly as given. Callers own keeping
+  // it out of reach of anything RPC-driven (see RequestPath()).
+  if (!driver_ok_) {
+    return Res(AudioResult::ERR_INVAL);
+  }
+  if (!ArbitrateStart(audio_class)) {
+    return Res(AudioResult::ERR_DROPPED);
+  }
+  if (!FileExists(path) || !ValidateWav(path)) {
+    return Res(AudioResult::ERR_NOENT);
+  }
+  const uint16_t volume = ApplyClassVolume(audio_class);
+  if (!PlayPath(path)) {
+    return Res(AudioResult::ERR_NOENT);  // validated a moment ago; only a delete race gets here
+  }
+  playing_class_ = U8(audio_class);
+  SendPlayingClass(playing_class_);
+  ULOG_INFO("AudioService: playing path '%s' (class=%u, volume=%u)", path, U8(audio_class), volume);
+  return Res(AudioResult::OK);
 }
 
 uint8_t AudioService::StartTone(TonePattern pattern, AudioClass audio_class, uint16_t freq, uint16_t duration_ms,

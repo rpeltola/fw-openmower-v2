@@ -163,6 +163,7 @@ void PowerService::check_adapter_chime_() {
   if (!adapter_present_known_) {
     // The first valid sample only establishes the baseline: booting while docked must not chime.
     adapter_present_ = present;
+    adapter_present_atomic_.store(present);
     adapter_present_known_ = true;
     return;
   }
@@ -175,6 +176,7 @@ void PowerService::check_adapter_chime_() {
     return;
   }
   adapter_present_ = present;
+  adapter_present_atomic_.store(present);
   adapter_edge_count_ = 0;
   audio_service.RequestTone(present ? TonePattern::CHARGE_CONNECT : TonePattern::CHARGE_DISCONNECT, AudioClass::UI);
 }
