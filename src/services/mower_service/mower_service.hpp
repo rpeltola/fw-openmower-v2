@@ -109,6 +109,23 @@ class MowerService : public MowerServiceBase {
   etl::atomic<bool> esc_ever_connected_{false};
   MotorDriver* mower_driver_ = nullptr;
 
+  // Stall detection: commanded duty magnitude above kStallDutyMin while the
+  // ESC reports (near-)zero eRPM, held continuously for kStallDwellUs and
+  // outside the post-spin-up grace window, latches a stall (see tick()).
+  static constexpr float kStallDutyMin = 0.15f;
+  // Units are eRPM (electrical RPM) -- what the ESC reports and what
+  // esc_state_.rpm holds; ROS divides by the motor's 4 pole pairs before
+  // publishing mechanical "mower_motor_rpm". Healthy mowing measures
+  // ~16000-17600 eRPM, a jam measures ~0, so this threshold is not sensitive
+  // to the exact figure -- do NOT "fix" it into mechanical RPM.
+  static constexpr float kStallRpmERpm = 1000.0f;
+  static constexpr uint32_t kStallDwellUs = 2000 * 1000u;
+  static constexpr uint32_t kSpinupGraceUs = 3000 * 1000u;
+
+  bool stall_latched_ = false;
+  uint32_t stall_condition_start_micros_ = 0;  // 0 = condition not currently held
+  uint32_t spinup_grace_until_micros_ = 0;     // stall detection suppressed while now < this
+
   RainDetector rain_detector_;
   // Wet threshold (raw ADC counts) streamed from ROS via the "Rain Threshold"
   // input; 0 = disabled. Defaults to disabled until ROS provides a value.

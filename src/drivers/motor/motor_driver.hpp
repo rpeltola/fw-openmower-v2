@@ -42,6 +42,8 @@ class MotorDriver {
     // separate field. Drivers that cannot tell one fault from another leave this at 0
     // (= no fault reported); 0 always means "nothing to report", never "fine".
     uint8_t fault_code;
+    // Motor/phase current, as distinct from the battery-side current_input above.
+    float current_motor;
   };
 
   typedef etl::delegate<void(const ESCState &new_state)> StateCallback;

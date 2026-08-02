@@ -19,12 +19,18 @@ void MowerService::OnCreate() {
 
 bool MowerService::OnStart() {
   mower_duty_ = 0;
+  stall_latched_ = false;
+  stall_condition_start_micros_ = 0;
+  spinup_grace_until_micros_ = 0;
   return true;
 }
 
 void MowerService::OnStop() {
   mower_duty_ = 0;
   esc_ever_connected_ = false;
+  stall_latched_ = false;
+  stall_condition_start_micros_ = 0;
+  spinup_grace_until_micros_ = 0;
 }
 
 void MowerService::tick() {
@@ -78,8 +84,40 @@ void MowerService::tick() {
     // We got recent data, send it
     StartTransaction();
     SendMowerESCTemperature(esc_state_.temperature_pcb);
+    // Despite the name, this is the battery-side INPUT current, not the motor
+    // phase current -- under a duty-mode stall it FALLS rather than rises (the
+    // ESC's current controller cuts duty to hold phase current at its own
+    // limit), so it is the wrong number to threshold a stall against. Kept as
+    // "Mower Motor Current" (id 5) for compatibility; see id 10 below for the
+    // real motor current.
     SendMowerMotorCurrent(esc_state_.current_input);
-    SendMowerStatus(static_cast<uint8_t>(esc_state_.status));
+    SendMowerMotorPhaseCurrent(esc_state_.current_motor);
+
+    // Stall detection. The ESC has no concept of stall: a duty-commanded
+    // locked rotor regulates phase current down to its limit and sits below
+    // every fault threshold it owns, indefinitely. Catch it here instead:
+    // commanded duty above kStallDutyMin while eRPM stays under kStallRpmERpm
+    // for kStallDwellUs, outside the post-spin-up grace window.
+    const uint32_t now_us = xbot::service::system::getTimeMicros();
+    const bool stall_condition = std::fabs(mower_duty_) > kStallDutyMin && std::fabs(esc_state_.rpm) < kStallRpmERpm;
+    const bool in_spinup_grace = now_us < spinup_grace_until_micros_;
+    if (stall_latched_) {
+      // Latched: keep the blade off regardless of what tripped it before.
+      // Only OnMowerSpeedChanged, on an explicit 0 command, may clear this.
+      mower_duty_ = 0;
+    } else if (!stall_condition || in_spinup_grace) {
+      stall_condition_start_micros_ = 0;
+    } else if (stall_condition_start_micros_ == 0) {
+      stall_condition_start_micros_ = now_us;
+    } else if (now_us - stall_condition_start_micros_ >= kStallDwellUs) {
+      // Tripped: cut the blade so the stalled winding stops cooking, and
+      // latch so firmware performs zero auto-retries (retry policy is ROS's).
+      stall_latched_ = true;
+      mower_duty_ = 0;
+    }
+
+    SendMowerStatus(stall_latched_ ? static_cast<uint8_t>(MotorDriver::ESCState::ESCStatus::ESC_STATUS_STALLED)
+                                   : static_cast<uint8_t>(esc_state_.status));
     // The cause behind an ERROR status, when the ESC can name one (VESC mc_fault_code;
     // 0 = nothing reported). Sent beside the status, never folded into it.
     SendMowerESCFaultCode(esc_state_.fault_code);
@@ -123,7 +161,28 @@ void MowerService::OnMowerSpeedChanged(const float& new_value) {
   // Commanded normalized speed/duty in [-1, 1]: sign = direction, magnitude =
   // speed, 0 = off. Applied directly; any ramp on reversal is handled by the
   // ESC's own duty ramp (and ROS goes through 0 between mow sessions).
-  mower_duty_ = new_value < -1.0f ? -1.0f : (new_value > 1.0f ? 1.0f : new_value);
+  const float clamped = new_value < -1.0f ? -1.0f : (new_value > 1.0f ? 1.0f : new_value);
+
+  if (clamped == 0.0f) {
+    // An explicit off is the only thing that releases a latched stall. ROS
+    // re-sends the commanded speed every tick, so releasing on "any command
+    // received" (or "any nonzero command") would clear the latch within one
+    // tick and produce an infinite grind-retry loop -- exactly the failure
+    // this exists to prevent. Firmware performs zero auto-retries; retry
+    // policy lives in ROS.
+    stall_latched_ = false;
+  } else if (stall_latched_) {
+    // Latched and still commanded on: ignore. mower_duty_ stays at 0 until
+    // an explicit 0 arrives and re-arms detection.
+    chMtxUnlock(&mtx);
+    return;
+  } else if (mower_duty_ == 0.0f) {
+    // Rising edge 0 -> nonzero: (re)start the spin-up grace window so normal
+    // ramp-up never trips stall detection.
+    spinup_grace_until_micros_ = last_duty_received_micros_ + kSpinupGraceUs;
+  }
+
+  mower_duty_ = clamped;
   if (!duty_sent_) {
     SetDuty();
   }

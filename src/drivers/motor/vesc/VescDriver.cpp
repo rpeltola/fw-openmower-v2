@@ -73,7 +73,9 @@ void VescDriver::ProcessPayload() {
           buffer_get_float16(message, 10.0, &index);  // 2 bytes - mc_interface_temp_fet_filtered()
       latest_state_.temperature_motor = buffer_get_float16(message, 10.0,
                                                            &index);  // 2 bytes - mc_interface_temp_motor_filtered()
-      index += 4;  // 4 bytes - mc_interface_read_reset_avg_motor_current()
+      latest_state_.current_motor =
+          buffer_get_float32(message, 100.0,
+                             &index);  // 4 bytes - mc_interface_read_reset_avg_motor_current()
       latest_state_.current_input =
           buffer_get_float32(message, 100.0,
                              &index);  // 4 bytes - mc_interface_read_reset_avg_input_current()
