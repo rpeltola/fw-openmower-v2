@@ -138,8 +138,11 @@ void ImuService::tick() {
 
     // Tilt from horizontal: angle between the gravity vector and the vertical
     // (z) axis. Independent of heading, so it covers pitch and roll on a slope.
+    // The z term keeps its sign so the range is a full 0-180 deg: folding it with
+    // fabsf() made an upside-down robot read as level, which is exactly the case a
+    // tilt gate exists to catch. Upright reads +g on z (base_link is z-up, REP-103).
     const float horizontal = sqrtf(static_cast<float>(axes[0] * axes[0] + axes[1] * axes[1]));
-    pitch_deg_ = atan2f(horizontal, fabsf(static_cast<float>(axes[2]))) * 180.0f / static_cast<float>(M_PI);
+    pitch_deg_ = atan2f(horizontal, static_cast<float>(axes[2])) * 180.0f / static_cast<float>(M_PI);
   }
 
   if (reg.status_reg.gda) {

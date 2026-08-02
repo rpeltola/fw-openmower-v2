@@ -28,6 +28,8 @@ class ImuService : public ImuServiceBase {
   // Absolute pitch/tilt angle from horizontal in degrees, derived from the
   // accelerometer. Returns the angle between the gravity vector and the
   // robot's vertical (z) axis, so it is independent of heading on a slope.
+  // Range is 0-180: 0 = upright, 90 = on its side, 180 = upside down. Anything
+  // gating on "is it flat" must therefore use a threshold, not a magnitude.
   float GetPitch() const {
     return pitch_deg_.load();
   }
