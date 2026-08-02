@@ -453,28 +453,42 @@ void YFCoverUI::HandleButton(const msg_event_button* msg) {
   const uint8_t btn_id = static_cast<uint8_t>(msg->button_id & 0x7F);
   const bool long_press = (msg->press_duration >= 1);
 
+  // Inject press into any registered Input configured as a button with matching button_id.
+  // Button inputs are identified by bit 7 of channel being set (BUTTON_FLAG).
+  // Bits [6:0] of channel carry the configured button_id.
+  bool any_button_configured = false;
+  bool matched = false;
+  for (auto& input : Inputs()) {
+    if (!YFCoverUIChannelIsButton(input.yf_cover_ui.channel)) {
+      continue;
+    }
+    any_button_configured = true;
+    if (YFCoverUIChannelButtonId(input.yf_cover_ui.channel) == btn_id) {
+      matched = true;
+      input.InjectPress(long_press);
+    }
+  }
+
   // Immediate press feedback, independent of whether ROS has configured this button: the beep
   // must not depend on a round trip (or on ROS being up at all). Runs on the comms thread, so
   // it goes through the AudioService mailbox rather than starting playback here. Rate-limited
   // because the panel may emit an event per duration threshold (single/long/very long) for one
-  // physical press - without the guard a held button would stutter-restart the ACK chirp.
+  // physical press - without the guard a held button would stutter-restart the chirp.
+  //
+  // The error buzz is deliberately narrow: it fires only when ROS has configured some button
+  // inputs but not this one, i.e. the press provably does nothing. While the input registry is
+  // still empty (ROS down, or simply not booted yet) every press acks exactly as before -
+  // buzzing then would punish the user for the Pi's state, which is the very dependency this
+  // feedback path exists to avoid. The firmware cannot tell "not configured yet" from
+  // "genuinely refused" in any other situation, so it does not guess.
+  const TonePattern pattern = (any_button_configured && !matched) ? TonePattern::ERROR : TonePattern::ACK;
   static systime_t last_beep_time = 0;
   static bool beeped_once = false;
   const systime_t now = chVTGetSystemTimeX();
   if (!beeped_once || chTimeDiffX(last_beep_time, now) > TIME_MS2I(400)) {
     beeped_once = true;
     last_beep_time = now;
-    audio_service.RequestTone(TonePattern::ACK, AudioClass::UI);
-  }
-
-  // Inject press into any registered Input configured as a button with matching button_id.
-  // Button inputs are identified by bit 7 of channel being set (BUTTON_FLAG).
-  // Bits [6:0] of channel carry the configured button_id.
-  for (auto& input : Inputs()) {
-    if (YFCoverUIChannelIsButton(input.yf_cover_ui.channel) &&
-        YFCoverUIChannelButtonId(input.yf_cover_ui.channel) == btn_id) {
-      input.InjectPress(long_press);
-    }
+    audio_service.RequestTone(pattern, AudioClass::UI);
   }
 }
 
