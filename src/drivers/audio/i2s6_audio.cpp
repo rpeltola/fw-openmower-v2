@@ -128,6 +128,15 @@ inline int16_t ApplyVolume(int16_t sample) {
 // Disables SPI6 + the BDMA stream and forgets the current source. Shared by the public Stop()
 // and by RefillHalfLocked() (which needs the same action once a fully-silent half confirms the
 // source has drained). Assumes audio_mutex_ is already held.
+//
+// Just clearing SPE (no CSUSP/CSTART dance) is enough: ST's own stm32h7xx_hal_i2s.c's
+// HAL_I2S_DMAStop() clears CFG1's DMA-enable bits, aborts the DMA, and calls __HAL_I2S_DISABLE()
+// (CLEAR_BIT CR1, SPI_CR1_SPE) - it never touches CSUSP or waits on CSTART. That's specific to I2S
+// master TX: CSUSP/"wait for CSTART to clear" is a generic-SPI abort-a-live-bus-transaction
+// sequence (see ChibiOS SPIv3's spi_lld_suspend(), used for its polled-exchange abort path), not
+// something I2S needs since there's no shared/addressed bus to leave in a clean state - clearing
+// SPE simply stops BCLK/WS. Play()'s re-arm sequence (SPE then an unconditional CSTART) already
+// matches HAL_I2S_Transmit_DMA()'s pattern regardless of whether CSTART was already set here.
 void DisableHardwareLocked() {
   SPI6->CR1 &= ~SPI_CR1_SPE;
   if (dma_stream_ != nullptr) {
@@ -216,6 +225,17 @@ bool Init() {
   // layout is unchanged on H7. I2SSTD=00 (Philips), DATLEN=00 (16-bit), CHLEN=0 (16-bit channel),
   // CKPOL=0 (clock idles low), MCKOE=0 (no master clock - unsupported/unneeded here) are all their
   // reset (zero) values, so they're simply left unset below.
+  //
+  // Verified NOT an amplitude-loss bug (issue #119 follow-up): DATLEN=00/CHLEN=0 is exactly
+  // ST's own I2S_DATAFORMAT_16B, defined as (0x00000000UL) in stm32h7xx_hal_i2s.h - i.e. ST's HAL
+  // programs the *identical* bit pattern for a plain 16-bit stream. A 16-bit sample in a 16-bit
+  // slot is transmitted MSB-first starting at the slot's own MSB (Philips protocol, RM0468
+  // §51.4.9 "I2S Philips standard"), so it occupies the full slot - no padding, no truncation,
+  // full 16-bit dynamic range. The classic failure this rules out is DATLEN=00 with CHLEN=1 (ST's
+  // I2S_DATAFORMAT_16B_EXTENDED, which ORs in SPI_I2SCFGR_CHLEN): that packs a 16-bit sample
+  // LSB-justified into a 32-bit slot, i.e. every sample plays back at 1/65536 of its true
+  // amplitude unless the upper 16 bits are also written. This driver never sets CHLEN, so that
+  // failure mode does not apply here.
   SPI6->I2SCFGR = SPI_I2SCFGR_I2SMOD | SPI_I2SCFGR_I2SCFG_1 | (kI2SDiv << SPI_I2SCFGR_I2SDIV_Pos) |
                   (kOdd != 0 ? SPI_I2SCFGR_ODD : 0);
 
@@ -223,6 +243,17 @@ bool Init() {
   // RM0468 §51.6.3 "SPI_CFG1". FTHLV (FIFO threshold, bits[8:5]) is left at its reset value of 0
   // = "1 data" - the DMA request stays asserted for every single 16-bit slot, which is what a
   // gapless audio stream needs (as opposed to bursting multiple slots per request).
+  //
+  // DSIZE[4:0] (bits[4:0]) is also left at its reset value of 0, which for plain SPI would be the
+  // reserved/illegal "1-bit frame" encoding (DSIZE encodes bits-1, per SPIv3's own
+  // spi_lld_polled_exchange(): `dsize = (CFG1 & SPI_CFG1_DSIZE_Msk) + 1`) - but this peripheral is
+  // in I2S mode (I2SMOD=1 above), and ST's own stm32h7xx_hal_i2s.c never touches CFG1 at all in
+  // HAL_I2S_Init(), and HAL_I2S_Transmit_DMA()/HAL_I2S_DMAStop() only ever set/clear
+  // SPI_CFG1_TXDMAEN - DSIZE and FTHLV are untouched. Frame size in I2S mode is governed entirely
+  // by I2SCFGR.DATLEN/CHLEN (set above); CFG1.DSIZE is a plain-SPI-only field the hardware ignores
+  // once I2SMOD=1, so DSIZE=0 here is not the reserved-value bug it would be in SPI mode. Likewise
+  // CR2.TSIZE (transfer size) is left at 0 = "unlimited" - ST's HAL never writes it for I2S either,
+  // consistent with this being a free-running circular-DMA stream rather than a bounded transfer.
   SPI6->CFG1 = SPI_CFG1_TXDMAEN;
 
   // ---- BDMA1 stream + DMAMUX2 request ----
@@ -289,8 +320,20 @@ void Play(SampleSource source) {
 
   // RM0468 §51.5.2: SPE is the single enable bit for both plain-SPI and I2S function on the H7's
   // unified SPI2S peripheral (unlike legacy F4/F7 parts, there is no separate I2SE bit) - setting
-  // it starts BCLK/WS generation.
+  // it powers up the peripheral, but on the unified SPI2S IP it does NOT by itself start BCLK/WS
+  // generation in master mode. CSTART ("master transfer start", CR1 bit 9) also has to be set.
+  // Confirmed against ST's own reference driver: stm32h7xx_hal_i2s.c's HAL_I2S_Transmit_DMA() does
+  // `if (SPE clear) __HAL_I2S_ENABLE(hi2s);` (SET_BIT CR1, SPI_CR1_SPE) immediately followed by an
+  // unconditional `SET_BIT(hi2s->Instance->CR1, SPI_CR1_CSTART);` before the transfer is considered
+  // started - CSTART is not optional. In-tree corroboration for the same unified SPI2S IP: ChibiOS's
+  // SPIv3 driver (ext/ChibiOS_21.11.3/os/hal/ports/STM32/LLD/SPIv3/hal_spi_v2_lld.c) sets SPE once
+  // in spi_lld_configure() (`spip->spi->CR1 = SPI_CR1_MASRX | SPI_CR1_SPE;`) but only actually
+  // starts a master transfer in the separate spi_lld_resume(), which does
+  // `spip->spi->CR1 |= SPI_CR1_CSTART;`. Without this, SPE alone leaves the peripheral enabled but
+  // idle - BCLK/WS never toggle and the amp never sees a clock, i.e. total silence independent of
+  // (and in addition to) the D-cache/BDMA coherency bug fixed above.
   SPI6->CR1 |= SPI_CR1_SPE;
+  SPI6->CR1 |= SPI_CR1_CSTART;
   playing_.store(true);
 
   chMtxUnlock(&audio_mutex_);

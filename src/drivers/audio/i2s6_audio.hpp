@@ -17,8 +17,12 @@
  * (SRAM4, cacheable) being read by BDMA - which bypasses the D-cache - without ever being
  * cache-cleaned first, so BDMA could transmit stale/frozen buffer content indefinitely regardless
  * of what RefillHalfLocked() had just written. i2s6_audio.cpp now flushes each half via
- * cacheBufferFlush() right after filling it, but that fix is build-verified only, NOT yet
- * confirmed against silicon. Every register value below is also derived from RM0468 (STM32H723
+ * cacheBufferFlush() right after filling it. A follow-up audit (issue #119 continued) found a
+ * second, independent total-silence bug: Play() was enabling SPI6 (CR1.SPE) without ever setting
+ * CR1.CSTART, which on the H7's unified SPI2S peripheral is required to actually start BCLK/WS
+ * generation in master mode (confirmed against ST's stm32h7xx_hal_i2s.c HAL_I2S_Transmit_DMA() -
+ * see i2s6_audio.cpp's Play()) - now fixed alongside it. Both fixes are build-verified only, NOT
+ * yet confirmed against silicon. Every register value below is also derived from RM0468 (STM32H723
  * reference manual) and this project's actual clock-tree configuration (boards/XCORE/mcuconf.h).
  * None of it is trusted until it's verified with a scope/logic analyzer:
  *  - BCLK / WS / DOUT waveforms on PG13 / PA15 / PB5 (frequency, polarity, bit alignment).
@@ -43,6 +47,26 @@
  * The MAX98357A needs no MCLK (it derives BCLK internally) and its SD_MODE pin is hardwired
  * (no GPIO on this board), so there is no software mute line: "mute" is simply "stop generating
  * BCLK/WS" (SPI6 disabled), at which point the amp auto-sleeps.
+ *
+ * ---- GAIN_SLOT / SD_MODE strapping on this board (hw-openmower-yardforce/Amplifier.kicad_sch) ----
+ * Traced from the schematic (issue #119 follow-up, to rule out the amp's fixed gain strap as the
+ * cause of the "very quiet even at full volume" behaviour reported under the older v1 firmware on
+ * this exact speaker/amp):
+ *  - GAIN_SLOT (pin 2): R8 (0R, populated) ties it directly to GND; R7 (1M pull-up to the 5V rail)
+ *    is DNP (not populated). Per the MAX98357A datasheet's GAIN table, "tied to GND" = 12 dB - the
+ *    second-highest of the five available settings (3/6/9/12/15 dB), well above the 9 dB floating
+ *    default. The gain strap is NOT a plausible explanation for a quiet amp; it is already close
+ *    to maximum. (Do not raise it further to compensate for anything software-side - see below.)
+ *  - SD_MODE (pin 4): R5 (1M pull-up to the 5V rail) is populated; R6 (1M pull-down to GND) is DNP.
+ *    With only the pull-up populated, this net sits close to VDD (5V), i.e. comfortably above the
+ *    >1.4 V "(L+R)/2" threshold and nowhere near the <0.16 V shutdown band - the amp is not
+ *    accidentally shut down, and the driver already duplicates its mono sample onto both I2S slots
+ *    (RefillHalfLocked()) so the averaged-mono selection is correct either way.
+ *  - Speaker output: OUTP/OUTN (pins 9/10) wire directly to the SPEAKER+/SPEAKER- sheet pins with
+ *    no series resistor, cap, or filter on this sheet that could attenuate the output.
+ * None of this rules out an assembly defect (wrong/missing part, cold joint) - only bench
+ * measurement of the strap voltages and the actual OUTP/OUTN waveform can confirm the as-built
+ * board matches this schematic.
  */
 
 #ifndef I2S6_AUDIO_HPP
