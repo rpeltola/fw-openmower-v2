@@ -103,6 +103,48 @@ void FilesystemService::RPCListFiles(uint16_t call_id, const char* Path, uint32_
   SendRpcResponse(call_id, RpcStatus::SUCCESS, data, *response_length);
 }
 
+bool FilesystemService::SumDirectory(const char* dir_path, unsigned depth, uint32_t* out_bytes, unsigned* visited) {
+  // Two independent bounds keep a deep or wide directory tree from tying up the service
+  // thread for the whole 512-entry / 4-level walk: kMaxDepth caps how many lfs_dir_t/lfs_info
+  // pairs pile up on the (small, static) thread stack via recursion, kMaxEntries caps total
+  // work regardless of shape. Neither bound is an error condition -- we just stop summing and
+  // report what we have, since a conservative undercount is far more useful to the caller than
+  // failing the whole RPC over an oversized subtree.
+  static constexpr unsigned kMaxDepth = 4;
+  static constexpr unsigned kMaxEntries = 512;
+
+  if (depth >= kMaxDepth) {
+    return true;
+  }
+
+  lfs_dir_t dir;
+  if (lfs_dir_open(&lfs, &dir, dir_path) != LFS_ERR_OK) {
+    return false;
+  }
+
+  struct lfs_info info {};
+  while (*visited < kMaxEntries && lfs_dir_read(&lfs, &dir, &info) > 0) {
+    (*visited)++;
+    if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+      continue;
+    }
+    if (info.type == LFS_TYPE_REG) {
+      *out_bytes += info.size;
+    } else if (info.type == LFS_TYPE_DIR) {
+      char child_path[160];
+      int n = snprintf(child_path, sizeof(child_path), "%s/%s", dir_path, info.name);
+      // A composed path that doesn't fit can only happen for a pathologically deep/long tree
+      // (BuildSafePath already bounds what a caller can hand us as the root); skip it rather
+      // than aborting the whole walk over one oversized entry.
+      if (n > 0 && static_cast<size_t>(n) < sizeof(child_path)) {
+        SumDirectory(child_path, depth + 1, out_bytes, visited);
+      }
+    }
+  }
+  lfs_dir_close(&lfs, &dir);
+  return true;
+}
+
 void FilesystemService::RPCRemoveFile(uint16_t call_id, const char* Path, uint32_t PathLen) {
   FsResult result;
   char path[160];
@@ -178,4 +220,47 @@ void FilesystemService::RPCAddFileChunk(uint16_t call_id, const char* Path, uint
 
   uint8_t r = static_cast<uint8_t>(result);
   SendRpcResponse(call_id, RpcStatus::SUCCESS, &r, 1);
+}
+
+void FilesystemService::RPCStat(uint16_t call_id, const char* Path, uint32_t PathLen, uint32_t* data,
+                                uint16_t* response_length) {
+  // Empty Path means the sandbox root, same convention as RPCListFiles.
+  char dir_path[160];
+  if (!BuildSafePath(Path, PathLen, dir_path, sizeof(dir_path))) {
+    SendRpcResponse(call_id, RpcStatus::ERROR, nullptr, 0);
+    return;
+  }
+
+  xbot::service::Lock lk{&fs_mtx_};
+
+  // total_bytes is the whole flash device's raw capacity, independent of Path.
+  const uint32_t total_bytes = lfs.cfg->block_size * lfs.cfg->block_count;
+
+  // lfs_fs_size() returns a count of blocks, not bytes -- multiply by block_size to get an
+  // approximation in bytes. It's also an upper bound rather than an exact figure: littlefs can
+  // count a block against more than one file while it's mid-relocation/compaction, so this can
+  // over-report slightly. It's still the number littlefs itself considers "used", which is what
+  // callers of this RPC actually want to know.
+  const lfs_ssize_t used_blocks = lfs_fs_size(&lfs);
+  if (used_blocks < 0) {
+    SendRpcResponse(call_id, RpcStatus::ERROR, nullptr, 0);
+    return;
+  }
+  const uint32_t used_bytes = static_cast<uint32_t>(used_blocks) * lfs.cfg->block_size;
+
+  // path_bytes only exists if Path resolves to a real directory -- unlike total/used above,
+  // this one does fail the RPC on a bad Path, since silently reporting 0 for a typoed path
+  // would look identical to an empty, valid one.
+  uint32_t path_bytes = 0;
+  unsigned visited = 0;
+  if (!SumDirectory(dir_path, 0, &path_bytes, &visited)) {
+    SendRpcResponse(call_id, RpcStatus::ERROR, nullptr, 0);
+    return;
+  }
+
+  data[0] = total_bytes;
+  data[1] = used_bytes;
+  data[2] = path_bytes;
+  *response_length = 3;
+  SendRpcResponse(call_id, RpcStatus::SUCCESS, data, *response_length * sizeof(uint32_t));
 }
