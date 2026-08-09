@@ -15,6 +15,8 @@ using namespace xbot::driver::motor;
 
 void DiffDriveService::OnEmergencyChangedEvent() {
   bool emergency = emergency_service.GetDriveBlockReasons() != 0;
+  left_esc_driver_->SetEmergency(emergency);
+  right_esc_driver_->SetEmergency(emergency);
   if (!emergency) {
     // only set speed to 0 if the emergency happens, not if it's cleared
     return;

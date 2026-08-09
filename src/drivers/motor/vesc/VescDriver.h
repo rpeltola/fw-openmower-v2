@@ -5,6 +5,7 @@
 #ifndef VESCDRIVER_H
 #define VESCDRIVER_H
 
+#include <etl/atomic.h>
 #include <etl/delegate.h>
 
 #include <cstdint>
@@ -24,12 +25,23 @@ class VescDriver : public DebuggableDriver, public MotorDriver {
   bool SetUART(UARTDriver *uart, uint32_t baudrate);
   void RequestStatus() override;
   void SetDuty(float duty) override;
+  void SetEmergency(bool active) override;
 
   void RawDataInput(uint8_t *data, size_t size) override;
 
   bool Start() override;
 
  private:
+  // True while an emergency is asserted. Set from the service side (see SetEmergency);
+  // read from SetDuty(), RawDataInput() and the receiving thread, so it needs to be safe
+  // across threads.
+  etl::atomic<bool> emergency_active_{false};
+
+  // Writes a duty command straight to the wire, bypassing the raw-mode guard in SetDuty().
+  // Used by SetDuty() itself (normal path) and by SetEmergency() (to force zero even while
+  // a debug raw session owns the link).
+  void WriteDutyRaw(float duty);
+
 #pragma pack(push, 1)
   struct VescPayload {
     // prepend space will be used for packet size / CAN ID
