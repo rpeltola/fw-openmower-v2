@@ -37,10 +37,30 @@ class DiffDriveService : public DiffDriveServiceBase {
   etl::atomic<uint8_t> escs_connected_{0};
   uint32_t last_duty_received_micros_ = 0;
 
-  uint32_t last_ticks_left = 0;
-  uint32_t last_ticks_right = 0;
   bool last_ticks_valid = false;
   uint32_t last_ticks_micros_ = 0;
+
+  // Per-wheel odometry. Each wheel's speed is derived from its OWN tacho delta over its OWN
+  // elapsed time, captured when that wheel's ESC frame arrives. The two drive ESCs are
+  // independent UART streams with no shared clock, so deriving the twist from both wheels'
+  // tacho deltas divided by a single shared dt spikes the reported speed whenever the L/R
+  // frames land close together (a full window of ticks divided by a near-zero gap) -- which
+  // poisons the positioning EKF. Per-wheel dt removes that coupling; the wheel speeds carry
+  // the ESC's own sign (same convention as the raw tacho delta).
+  uint32_t odom_last_tacho_l_ = 0;
+  uint32_t odom_last_tacho_r_ = 0;
+  uint32_t odom_last_micros_l_ = 0;
+  uint32_t odom_last_micros_r_ = 0;
+  bool odom_valid_l_ = false;
+  bool odom_valid_r_ = false;
+  float wheel_speed_l_mps_ = 0.0f;
+  float wheel_speed_r_mps_ = 0.0f;
+  // An inter-frame gap smaller than this is the L/R-desync artifact, not a real measurement
+  // window: keep the previous wheel speed rather than dividing a full delta by it. Above the
+  // upper bound the ESC has gone quiet (UART glitch); also hold, so a reconnect does not
+  // integrate the whole gap into one spike.
+  static constexpr float kMinOdomDtS = 0.008f;
+  static constexpr float kMaxOdomDtS = 0.20f;
 
   // Per-wheel duty cycle [-1, 1] actually sent to the ESC (both modes output duty).
   float speed_l_ = 0;
@@ -200,6 +220,9 @@ class DiffDriveService : public DiffDriveServiceBase {
 
   void LeftESCCallback(const MotorDriver::ESCState &state);
   void RightESCCallback(const MotorDriver::ESCState &state);
+  // Integrate one wheel's tacho over its own elapsed time into wheel_speed_[lr]_mps_.
+  // Called from that wheel's ESC callback so each wheel uses its own, consistent dt.
+  void UpdateWheelOdometry(bool left);
   void ProcessStatusUpdate();
 
  protected:

@@ -116,6 +116,7 @@ bool DiffDriveService::OnStart() {
   // is dropped here: the newest full reconfigure wins over an older live tune.
   tune_kp_ = tune_ki_ = tune_ks_ = tune_kv_ = tune_out_max_ = tune_slew_ = -1.0f;
   last_ticks_valid = false;
+  odom_valid_l_ = odom_valid_r_ = false;
   return true;
 }
 
@@ -138,6 +139,7 @@ void DiffDriveService::OnCreate() {
 void DiffDriveService::OnStop() {
   ResetControlState();
   last_ticks_valid = false;
+  odom_valid_l_ = odom_valid_r_ = false;
   escs_connected_ = 0;
 }
 
@@ -281,6 +283,7 @@ void DiffDriveService::LeftESCCallback(const MotorDriver::ESCState& state) {
   left_esc_state_ = state;
   left_esc_state_valid_ = true;
   escs_connected_ |= ESC_LEFT;
+  UpdateWheelOdometry(true);
   if (right_esc_state_valid_) {
     ProcessStatusUpdate();
   }
@@ -292,10 +295,33 @@ void DiffDriveService::RightESCCallback(const MotorDriver::ESCState& state) {
   right_esc_state_ = state;
   right_esc_state_valid_ = true;
   escs_connected_ |= ESC_RIGHT;
+  UpdateWheelOdometry(false);
   if (left_esc_state_valid_) {
     ProcessStatusUpdate();
   }
   chMtxUnlock(&state_mutex_);
+}
+
+void DiffDriveService::UpdateWheelOdometry(bool left) {
+  const uint32_t micros = xbot::service::system::getTimeMicros();
+  const uint32_t tacho = left ? left_esc_state_.tacho : right_esc_state_.tacho;
+  uint32_t& last_tacho = left ? odom_last_tacho_l_ : odom_last_tacho_r_;
+  uint32_t& last_micros = left ? odom_last_micros_l_ : odom_last_micros_r_;
+  bool& valid = left ? odom_valid_l_ : odom_valid_r_;
+  float& speed = left ? wheel_speed_l_mps_ : wheel_speed_r_mps_;
+
+  if (valid) {
+    // Unsigned subtraction is wrap-safe (getTimeMicros() is a free-running uint32).
+    const float dt = static_cast<float>(micros - last_micros) / 1'000'000.0f;
+    if (dt >= kMinOdomDtS && dt <= kMaxOdomDtS) {
+      const int32_t d_ticks = static_cast<int32_t>(tacho - last_tacho);
+      speed = static_cast<float>(d_ticks) / (dt * static_cast<float>(WheelTicksPerMeter.value));
+    }
+    // else: hold the previous speed -- this interval is the L/R-desync artifact or a gap.
+  }
+  last_tacho = tacho;
+  last_micros = micros;
+  valid = true;
 }
 
 void DiffDriveService::ProcessStatusUpdate() {
@@ -327,14 +353,16 @@ void DiffDriveService::ProcessStatusUpdate() {
   SendRightESCMotorTemperature(right_esc_state_.temperature_motor);
   SendRightESCFaultCode(right_esc_state_.fault_code);
 
-  // Calculate the twist according to wheel ticks
+  // Body twist from the per-wheel speeds (each integrated over its own dt in the ESC
+  // callbacks, see UpdateWheelOdometry). The right wheel is mounted mirrored, so its tacho
+  // -- and hence wheel_speed_r_mps_ -- already carries the opposite sign to the left for
+  // forward motion; this reproduces the previous (d_left - d_right)/(d_left + d_right)
+  // convention exactly, without the shared-dt coupling that spiked the old computation.
+  // `dt` here is still the status-pair interval, kept solely for the speed loop below.
   if (last_ticks_valid) {
     float dt = static_cast<float>(micros - last_ticks_micros_) / 1'000'000.0f;
-    int32_t d_left = static_cast<int32_t>(left_esc_state_.tacho - last_ticks_left);
-    int32_t d_right = static_cast<int32_t>(right_esc_state_.tacho - last_ticks_right);
-    float vx = static_cast<float>(d_left - d_right) / (2.0f * dt * static_cast<float>(WheelTicksPerMeter.value));
-    float vr = -static_cast<float>(d_left + d_right) /
-               (static_cast<float>(WheelDistance.value) * dt * static_cast<float>(WheelTicksPerMeter.value));
+    float vx = (wheel_speed_l_mps_ - wheel_speed_r_mps_) / 2.0f;
+    float vr = -(wheel_speed_l_mps_ + wheel_speed_r_mps_) / static_cast<float>(WheelDistance.value);
     double data[6]{};
     data[0] = vx;
     data[5] = vr;
@@ -407,8 +435,6 @@ void DiffDriveService::ProcessStatusUpdate() {
     }
   }
   last_ticks_valid = true;
-  last_ticks_left = left_esc_state_.tacho;
-  last_ticks_right = right_esc_state_.tacho;
   last_ticks_micros_ = micros;
 
   right_esc_state_valid_ = left_esc_state_valid_ = false;
