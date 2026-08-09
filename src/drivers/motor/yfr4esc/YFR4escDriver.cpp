@@ -124,9 +124,25 @@ void YFR4escDriver::ProcessRxBytes(const volatile uint8_t* data, size_t len) {
 }
 
 void YFR4escDriver::SetDuty(float duty) {
+  if (emergency_active_) {
+    // An asserted emergency is authoritative: force zero onto the wire regardless of the
+    // requested duty or whether a raw passthrough session currently owns the link.
+    // SendControl() writes straight to the UART, so this already bypasses raw mode.
+    SendControl(0.0f);
+    return;
+  }
   if (!IsStarted() || IsRawMode()) return;
   last_duty_ = duty;
   SendControl(duty);
+}
+
+void YFR4escDriver::SetEmergency(bool active) {
+  emergency_active_ = active;
+  if (active) {
+    // Immediately zero the motor, bypassing the raw-mode guard, so the emergency is
+    // authoritative from the moment it is asserted even if a debug session is connected.
+    SendControl(0.0f);
+  }
 }
 
 void YFR4escDriver::SendControl(float duty) {
@@ -172,6 +188,11 @@ void YFR4escDriver::SendSettings() {
 
 void YFR4escDriver::RawDataInput(uint8_t* data, size_t size) {
   if (!IsRawMode() || !IsStarted()) return;
+  if (emergency_active_) {
+    // Drop client-forwarded bytes while an emergency is asserted, so a connected debug
+    // session cannot re-command duty over the e-stop.
+    return;
+  }
   chMtxLock(&mutex_);
   size_t len = size > TX_BUFFER_SIZE ? TX_BUFFER_SIZE : size;
   memcpy(tx_buffer_, data, len);
@@ -255,7 +276,18 @@ void YFR4escDriver::threadFunc() {
     systime_t now = chVTGetSystemTimeX();
     if ((now - last_heartbeat) >= HEARTBEAT_INTERVAL) {
       last_heartbeat += HEARTBEAT_INTERVAL;
-      SendControl(last_duty_);
+      if (emergency_active_) {
+        // Actively command zero every heartbeat during an emergency, so the ESC's own
+        // comm watchdog stays fed without ever re-sending a stale nonzero duty.
+        SendControl(0.0f);
+      } else if (IsRawMode()) {
+        // Let the raw passthrough session own the UART; don't fight it with our own
+        // writes. Drop the stale duty so that if the client disconnects mid-session,
+        // the resumed heartbeat cannot restore a pre-session duty from memory.
+        last_duty_ = 0.0f;
+      } else {
+        SendControl(last_duty_);
+      }
     }
   }
 }

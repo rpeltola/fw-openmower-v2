@@ -53,6 +53,14 @@ class MotorDriver {
   virtual void RequestStatus() = 0;
   virtual void SetDuty(float duty) = 0;
 
+  // Emergency latch: while active, a driver that owns a wire link must force (and keep
+  // forcing) zero duty onto it, authoritative over anything else touching that link (e.g.
+  // a connected debug raw-passthrough session). Default is a no-op for drivers with no
+  // such link to defend.
+  virtual void SetEmergency(bool active) {
+    (void)active;
+  }
+
   virtual bool Start() {
     chDbgAssert(!started_, "Don't start twice");
     started_ = true;

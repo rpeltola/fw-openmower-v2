@@ -209,12 +209,7 @@ void VescDriver::RequestStatus() {
   chMtxUnlock(&mutex_);
 }
 
-void VescDriver::SetDuty(float duty) {
-  if (IsRawMode()) {
-    // ignore when a raw data stream is connected
-    return;
-  }
-
+void VescDriver::WriteDutyRaw(float duty) {
   chMtxLock(&mutex_);
   payload_buffer_.payload_length = 5;
   payload_buffer_.payload[0] = COMM_SET_DUTY;
@@ -224,11 +219,39 @@ void VescDriver::SetDuty(float duty) {
   chMtxUnlock(&mutex_);
 }
 
+void VescDriver::SetDuty(float duty) {
+  if (emergency_active_) {
+    // An asserted emergency is authoritative: force zero onto the wire regardless of the
+    // requested duty or whether a raw passthrough session currently owns the link.
+    WriteDutyRaw(0.0f);
+    return;
+  }
+  if (IsRawMode()) {
+    // ignore when a raw data stream is connected
+    return;
+  }
+  WriteDutyRaw(duty);
+}
+
+void VescDriver::SetEmergency(bool active) {
+  emergency_active_ = active;
+  if (active) {
+    // Immediately zero the motor, bypassing the raw-mode guard, so the emergency is
+    // authoritative from the moment it is asserted even if a debug session is connected.
+    WriteDutyRaw(0.0f);
+  }
+}
+
 void VescDriver::RawDataInput(uint8_t* data, size_t size) {
   if (!IsRawMode()) {
     return;
   }
   if (!IsStarted()) {
+    return;
+  }
+  if (emergency_active_) {
+    // Drop client-forwarded bytes while an emergency is asserted, so a connected debug
+    // session cannot re-command duty over the e-stop.
     return;
   }
   // Lock mutex so that during transmission we don't start a second one

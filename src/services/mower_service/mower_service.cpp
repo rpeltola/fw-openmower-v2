@@ -203,6 +203,7 @@ bool MowerService::IsHealthy() {
 }
 void MowerService::OnEmergencyChangedEvent() {
   bool emergency = emergency_service.GetBladeBlockReasons() != 0;
+  mower_driver_->SetEmergency(emergency);
   if (!emergency) {
     // only set speed to 0 if the emergency happens, not if it's cleared
     return;

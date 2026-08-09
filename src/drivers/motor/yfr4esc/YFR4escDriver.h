@@ -5,6 +5,8 @@
 #ifndef YFR4ESCDRIVER_H
 #define YFR4ESCDRIVER_H
 
+#include <etl/atomic.h>
+
 #include <cstdint>
 #include <debug/debuggable_driver.hpp>
 #include <drivers/motor/motor_driver.hpp>
@@ -25,6 +27,7 @@ class YFR4escDriver : public DebuggableDriver, public MotorDriver {
 
   void RequestStatus() override{};  // No-op, ESC streams status periodically
   void SetDuty(float duty) override;
+  void SetEmergency(bool active) override;
   bool Start() override;
 
   void RawDataInput(uint8_t* data, size_t size) override;
@@ -34,6 +37,11 @@ class YFR4escDriver : public DebuggableDriver, public MotorDriver {
   static constexpr systime_t HEARTBEAT_INTERVAL = TIME_MS2I(100);  // 10 Hz
 
   float last_duty_ = 0.0f;
+
+  // True while an emergency is asserted. Set from the service side (see SetEmergency);
+  // read from SetDuty(), RawDataInput() and the heartbeat in threadFunc(), so it needs to
+  // be safe across threads.
+  etl::atomic<bool> emergency_active_{false};
 
   struct UARTConfigEx : UARTConfig {
     YFR4escDriver* context;
